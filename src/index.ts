@@ -62,21 +62,6 @@ function reject(ctx: ReqCtx, allowedOrigin: string, status: number, message: str
 	});
 }
 
-function isAllowedMediaSource(req: Request, allowedOrigin: string): boolean {
-	const origin = req.headers.get('Origin');
-	if (origin) return origin === allowedOrigin;
-
-	// Some media requests may omit Origin; fallback to Referer check for protected streams.
-	const referer = req.headers.get('Referer');
-	if (!referer) return false;
-
-	try {
-		return new URL(referer).origin === allowedOrigin;
-	} catch {
-		return false;
-	}
-}
-
 function b64uDecode(str: string): string {
 	let b = str.replace(/-/g, '+').replace(/_/g, '/');
 	while (b.length % 4) b += '=';
@@ -224,11 +209,6 @@ export default {
 			// - reject only when Origin exists and mismatches ALLOWED_ORIGIN
 			if (origin && origin !== allowed) {
 				return reject(ctx, allowed, 403, 'Origin not allowed', 'origin_mismatch');
-			}
-
-			const isProtectedMedia = path.endsWith('.m3u8') || path.endsWith('.ts');
-			if (isProtectedMedia && !isAllowedMediaSource(req, allowed)) {
-				return reject(ctx, allowed, 403, 'Forbidden media source', 'media_source_not_allowed');
 			}
 
 			if (path.endsWith('.m3u8')) {

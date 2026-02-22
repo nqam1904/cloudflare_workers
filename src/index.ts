@@ -4,7 +4,38 @@ export interface Env {
   ALLOWED_ORIGIN: string;
 }
 
-// TODO: Add logging + update tránh seek nhiều quá
+/* ===================== TYPES ===================== */
+type TokenPayload = { vid: string; exp?: number; [k: string]: unknown };
+
+type ReqCtx = {
+  path: string;
+  origin: string | null;
+  range: string | null;
+};
+
+type VerifyResult =
+  | { ok: true; payload: TokenPayload }
+  | { ok: false; reason: string };
+
+/* ===================== LOGGING ===================== */
+function logEvent(event: string, ctx: ReqCtx, status: number, reason?: string): void {
+  const payload: {
+    event: string;
+    path: string;
+    origin: string | null;
+    range: string | null;
+    status: number;
+    reason?: string;
+  } = {
+    event,
+    path: ctx.path,
+    origin: ctx.origin,
+    range: ctx.range,
+    status,
+  };
+  if (reason) payload.reason = reason;
+  console.log(JSON.stringify(payload));
+}
 
 /* ===================== CORS ===================== */
 function cors(origin: string | null, allowed: string): Headers {
@@ -15,6 +46,15 @@ function cors(origin: string | null, allowed: string): Headers {
   h.set('Access-Control-Allow-Headers', 'Content-Type, Range');
   h.set('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Accept-Ranges');
   return h;
+}
+
+function makeReject(allowed: string) {
+  return (ctx: ReqCtx, status: number, reason: string): Response => {
+    logEvent('request_rejected', ctx, status, reason);
+    const h = cors(ctx.origin, allowed);
+    h.set('Content-Type', 'text/plain');
+    return new Response(reason, { status, headers: h });
+  };
 }
 
 function resp(
@@ -63,11 +103,11 @@ async function sign(body: string, secret: string): Promise<string> {
   return b64uEncode(`${body}.${sig}`);
 }
 
-async function verify(token: string, secret: string): Promise<any | null> {
+async function verifyToken(token: string, secret: string): Promise<VerifyResult> {
   try {
     const decoded = b64uDecode(token);
     const [json, sig] = decoded.split('.');
-    if (!json || !sig) return null;
+    if (!json || !sig) return { ok: false, reason: 'malformed_token' };
 
     const key = await crypto.subtle.importKey(
       'raw',
@@ -85,10 +125,15 @@ async function verify(token: string, secret: string): Promise<any | null> {
       .map(b => b.toString(16).padStart(2, '0'))
       .join('');
 
-    if (expected !== sig) return null;
-    return JSON.parse(json);
+    if (expected !== sig) return { ok: false, reason: 'bad_signature' };
+
+    const payload = JSON.parse(json) as TokenPayload;
+    if (payload.exp !== undefined && payload.exp <= Math.floor(Date.now() / 1000)) {
+      return { ok: false, reason: 'token_expired' };
+    }
+    return { ok: true, payload };
   } catch {
-    return null;
+    return { ok: false, reason: 'decode_error' };
   }
 }
 
@@ -99,42 +144,48 @@ export default {
     const referer = req.headers.get('Referer') || '';
     const allowed = env.ALLOWED_ORIGIN;
 
+    const url = new URL(req.url);
+    const ctx: ReqCtx = {
+      path: url.pathname,
+      origin,
+      range: req.headers.get('Range'),
+    };
+    const reject = makeReject(allowed);
+
     try {
-      const url = new URL(req.url);
-      const path = url.pathname;
+      const { path } = ctx;
 
       // OPTIONS
       if (req.method === 'OPTIONS') {
+        logEvent('preflight', ctx, 204);
         return resp('OK', 204, origin, allowed);
       }
 
       // FRONTEND ONLY
       if (!(origin === allowed || referer.startsWith(allowed))) {
-        return resp('Origin not allowed', 403, origin, allowed, {
-          'Content-Type': 'text/plain',
-        });
+        return reject(ctx, 403, 'origin_not_allowed');
       }
 
       /* ===== m3u8 ===== */
       if (path.endsWith('.m3u8')) {
         const token = url.searchParams.get('token');
         if (!token) {
-          return resp('Missing video token', 403, origin, allowed, { 'Content-Type': 'text/plain' });
+          return reject(ctx, 403, 'missing_video_token');
         }
 
-        const main = await verify(token, env.VIDEO_TOKEN_SECRET);
-        if (!main || main.exp <= Math.floor(Date.now() / 1000)) {
-          return resp('Invalid video token', 403, origin, allowed, { 'Content-Type': 'text/plain' });
+        const result = await verifyToken(token, env.VIDEO_TOKEN_SECRET);
+        if (!result.ok) {
+          return reject(ctx, 403, result.reason);
         }
 
-        const obj = await env.R2_BUCKET.get(path.slice(1));
+        const r2Key = path.slice(1);
+        const obj = await env.R2_BUCKET.get(r2Key);
         if (!obj) {
-          return resp('Video not found', 404, origin, allowed, { 'Content-Type': 'text/plain' });
+          return reject(ctx, 404, 'manifest_not_found');
         }
 
-        // segment token KHÔNG expire – chỉ bind theo videoId
         const segToken = await sign(
-          JSON.stringify({ vid: main.vid }),
+          JSON.stringify({ vid: result.payload.vid }),
           env.VIDEO_TOKEN_SECRET,
         );
 
@@ -144,6 +195,7 @@ export default {
           `$1?st=${segToken}`,
         );
 
+        logEvent('manifest_served', ctx, 200);
         return resp(playlist, 200, origin, allowed, {
           'Content-Type': 'application/vnd.apple.mpegurl',
           'Cache-Control': 'no-store',
@@ -154,12 +206,15 @@ export default {
       if (path.endsWith('.ts')) {
         const st = url.searchParams.get('st');
         if (!st) {
-          return resp('Missing segment token', 403, origin, allowed, { 'Content-Type': 'text/plain' });
+          return reject(ctx, 403, 'missing_segment_token');
         }
 
-        const seg = await verify(st, env.VIDEO_TOKEN_SECRET);
-        if (!seg || !seg.vid || !path.includes(seg.vid)) {
-          return resp('Invalid segment token', 403, origin, allowed, { 'Content-Type': 'text/plain' });
+        const result = await verifyToken(st, env.VIDEO_TOKEN_SECRET);
+        if (!result.ok) {
+          return reject(ctx, 403, `seg_${result.reason}`);
+        }
+        if (!result.payload.vid || !path.includes(result.payload.vid)) {
+          return reject(ctx, 403, 'seg_vid_mismatch');
         }
       }
 
@@ -179,12 +234,13 @@ export default {
         }
       }
 
+      const r2Key = path.slice(1);
       const obj = await env.R2_BUCKET.get(
-        path.slice(1),
+        r2Key,
         range ? { range } : undefined,
       );
       if (!obj) {
-        return resp('File not found', 404, origin, allowed, { 'Content-Type': 'text/plain' });
+        return reject(ctx, 404, 'file_not_found');
       }
 
       const headers = cors(origin, allowed);
@@ -207,12 +263,14 @@ export default {
         );
       }
 
-      return new Response(obj.body, {
-        status: range ? 206 : 200,
-        headers,
-      });
+      const status = range ? 206 : 200;
+      logEvent('r2_served', ctx, status);
+
+      return new Response(obj.body, { status, headers });
     } catch (error) {
-      return resp(error instanceof Error ? error.message : 'Unknown error', 403, origin, allowed, {
+      const message = error instanceof Error ? error.message : 'Unknown error';
+      logEvent('worker_error', ctx, 500, message);
+      return resp(message, 500, origin, allowed, {
         'Content-Type': 'text/plain',
       });
     }

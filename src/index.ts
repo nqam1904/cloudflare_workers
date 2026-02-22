@@ -5,7 +5,12 @@ export interface Env {
 }
 
 /* ===================== TYPES ===================== */
-type TokenPayload = { vid: string; exp?: number; [k: string]: unknown };
+
+type TokenPayload = {
+	vid: string;
+	exp?: number;
+	[k: string]: unknown;
+};
 
 type ReqCtx = {
 	path: string;
@@ -16,33 +21,34 @@ type ReqCtx = {
 type VerifyResult = { ok: true; payload: TokenPayload } | { ok: false; reason: string };
 
 /* ===================== LOGGING ===================== */
+
 function logEvent(event: string, ctx: ReqCtx, status: number, reason?: string): void {
-	const payload: {
-		event: string;
-		path: string;
-		origin: string | null;
-		range: string | null;
-		status: number;
-		reason?: string;
-	} = {
+	const payload: any = {
 		event,
 		path: ctx.path,
 		origin: ctx.origin,
 		range: ctx.range,
 		status,
 	};
+
 	if (reason) payload.reason = reason;
 	console.log(JSON.stringify(payload));
 }
 
 /* ===================== CORS ===================== */
+
 function cors(origin: string | null, allowed: string): Headers {
 	const h = new Headers();
-	if (origin === allowed) h.set('Access-Control-Allow-Origin', allowed);
+
+	if (origin === allowed) {
+		h.set('Access-Control-Allow-Origin', allowed);
+	}
+
 	h.set('Vary', 'Origin');
 	h.set('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
 	h.set('Access-Control-Allow-Headers', 'Content-Type, Range');
 	h.set('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Accept-Ranges');
+
 	return h;
 }
 
@@ -62,6 +68,7 @@ function resp(body: BodyInit | null, status: number, origin: string | null, allo
 }
 
 /* ===================== BASE64URL ===================== */
+
 function b64uDecode(str: string): string {
 	let b = str.replace(/-/g, '+').replace(/_/g, '/');
 	while (b.length % 4) b += '=';
@@ -72,11 +79,26 @@ function b64uEncode(str: string): string {
 	return btoa(str).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
+/* ===================== SECURITY HELPERS ===================== */
+
+function safeEqual(a: string, b: string): boolean {
+	if (a.length !== b.length) return false;
+	let result = 0;
+	for (let i = 0; i < a.length; i++) {
+		result |= a.charCodeAt(i) ^ b.charCodeAt(i);
+	}
+	return result === 0;
+}
+
 /* ===================== SIGN / VERIFY ===================== */
+
 async function sign(body: string, secret: string): Promise<string> {
 	const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+
 	const buf = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(body));
+
 	const sig = [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('');
+
 	return b64uEncode(`${body}.${sig}`);
 }
 
@@ -84,18 +106,26 @@ async function verifyToken(token: string, secret: string): Promise<VerifyResult>
 	try {
 		const decoded = b64uDecode(token);
 		const [json, sig] = decoded.split('.');
-		if (!json || !sig) return { ok: false, reason: 'malformed_token' };
+		if (!json || !sig) {
+			return { ok: false, reason: 'malformed_token' };
+		}
 
 		const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+
 		const buf = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(json));
+
 		const expected = [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('');
 
-		if (expected !== sig) return { ok: false, reason: 'bad_signature' };
+		if (!safeEqual(expected, sig)) {
+			return { ok: false, reason: 'bad_signature' };
+		}
 
 		const payload = JSON.parse(json) as TokenPayload;
+
 		if (payload.exp !== undefined && payload.exp <= Math.floor(Date.now() / 1000)) {
 			return { ok: false, reason: 'token_expired' };
 		}
+
 		return { ok: true, payload };
 	} catch {
 		return { ok: false, reason: 'decode_error' };
@@ -103,6 +133,7 @@ async function verifyToken(token: string, secret: string): Promise<VerifyResult>
 }
 
 /* ===================== WORKER ===================== */
+
 export default {
 	async fetch(req: Request, env: Env): Promise<Response> {
 		const origin = req.headers.get('Origin');
@@ -110,28 +141,34 @@ export default {
 		const allowed = env.ALLOWED_ORIGIN;
 
 		const url = new URL(req.url);
+
 		const ctx: ReqCtx = {
 			path: url.pathname,
 			origin,
 			range: req.headers.get('Range'),
 		};
+
 		const reject = makeReject(allowed);
 
 		try {
 			const { path } = ctx;
 
-			// OPTIONS
+			/* ===== OPTIONS ===== */
 			if (req.method === 'OPTIONS') {
 				logEvent('preflight', ctx, 204);
 				return resp('OK', 204, origin, allowed);
 			}
 
-			// FRONTEND ONLY
+			/* ===== ORIGIN CHECK ===== */
+			if (!origin && !referer) {
+				return reject(ctx, 403, 'missing_origin');
+			}
+
 			if (!(origin === allowed || referer.startsWith(allowed))) {
 				return reject(ctx, 403, 'origin_not_allowed');
 			}
 
-			/* ===== m3u8 ===== */
+			/* ===== MANIFEST (.m3u8) ===== */
 			if (path.endsWith('.m3u8')) {
 				const token = url.searchParams.get('token');
 				if (!token) {
@@ -139,6 +176,7 @@ export default {
 				}
 
 				const result = await verifyToken(token, env.VIDEO_TOKEN_SECRET);
+
 				if (!result.ok) {
 					return reject(ctx, 403, result.reason);
 				}
@@ -149,13 +187,14 @@ export default {
 					return reject(ctx, 404, 'manifest_not_found');
 				}
 
-				// segment token KHÔNG expire – chỉ bind theo videoId
 				const segToken = await sign(JSON.stringify({ vid: result.payload.vid }), env.VIDEO_TOKEN_SECRET);
 
 				let playlist = await obj.text();
-				playlist = playlist.replace(/([^\s]+\.ts)/g, `$1?st=${segToken}`);
+
+				playlist = playlist.replace(/^(?!#)(.+\.ts)$/gm, `$1?st=${segToken}`);
 
 				logEvent('manifest_served', ctx, 200);
+
 				return resp(playlist, 200, origin, allowed, {
 					'Content-Type': 'application/vnd.apple.mpegurl',
 					'Cache-Control': 'no-store',
@@ -170,15 +209,23 @@ export default {
 				}
 
 				const result = await verifyToken(st, env.VIDEO_TOKEN_SECRET);
+
 				if (!result.ok) {
 					return reject(ctx, 403, `seg_${result.reason}`);
 				}
-				if (!result.payload.vid || !path.includes(result.payload.vid)) {
+
+				// Extract vid from path:
+				// /course-videos/{vid}/hls/seg_xxx.ts
+				const parts = path.split('/').filter(Boolean);
+				const pathVid = parts.length >= 2 ? parts[1] : null;
+
+				if (!result.payload.vid || result.payload.vid !== pathVid) {
 					return reject(ctx, 403, 'seg_vid_mismatch');
 				}
 			}
 
-			/* ===== FETCH R2 (RANGE SUPPORT) ===== */
+			/* ===== RANGE SUPPORT ===== */
+
 			const rangeHeader = req.headers.get('Range');
 			let range: R2Range | undefined;
 
@@ -196,6 +243,7 @@ export default {
 
 			const r2Key = path.slice(1);
 			const obj = await env.R2_BUCKET.get(r2Key, range ? { range } : undefined);
+
 			if (!obj) {
 				return reject(ctx, 404, 'file_not_found');
 			}
@@ -220,10 +268,15 @@ export default {
 			const status = range ? 206 : 200;
 			logEvent('r2_served', ctx, status);
 
-			return new Response(obj.body, { status, headers });
+			return new Response(obj.body, {
+				status,
+				headers,
+			});
 		} catch (error) {
 			const message = error instanceof Error ? `${error.name}: ${error.message}` : 'Unknown error';
+
 			logEvent('worker_error', ctx, 500, message);
+
 			return resp(message, 500, origin, allowed, {
 				'Content-Type': 'text/plain',
 			});

@@ -1,7 +1,14 @@
+const DISCORD_FIELD_VALUE_LIMIT = 1000;
+
+function truncateWebhookFieldValue(value: string): string {
+	return value.slice(0, DISCORD_FIELD_VALUE_LIMIT);
+}
+
 export interface Env {
 	VIDEO_TOKEN_SECRET: string;
 	R2_BUCKET: R2Bucket;
 	ALLOWED_ORIGIN: string;
+	WEBHOOK_DISCORD_URL?: string;
 }
 
 /* ===================== TYPES ===================== */
@@ -57,8 +64,85 @@ function cors(origin: string | null, referer: string, allowed: string): Headers 
 	return h;
 }
 
-function makeReject(allowed: string, referer: string) {
+/* ===================== DISCORD WEBHOOK ===================== */
+
+type WebhookPayload = {
+	title?: string;
+	color?: number;
+	fields?: Array<{ name: string; value: string; inline?: boolean }>;
+	footerText?: string;
+	userId?: string;
+	userEmail?: string;
+	nodeEnv?: string;
+};
+
+function buildDiscordEmbed(payload: WebhookPayload): object {
+	const title = payload.title ?? 'Notification';
+	const color = typeof payload.color === 'number' ? payload.color : 0xff0000;
+	const nodeEnv = (payload.nodeEnv || 'unknown').toUpperCase();
+	const envEmoji = nodeEnv === 'PRODUCTION' ? '🔴' : nodeEnv === 'DEVELOPMENT' ? '🟢' : '🟡';
+	const baseFields: Array<{ name: string; value: string; inline?: boolean }> = [
+		{ name: '🏷️ Environment', value: `${envEmoji} **${nodeEnv}**`, inline: false },
+		{ name: '👤 User', value: `ID: \`${payload.userId ?? 'N/A'}\`\nEmail: \`${payload.userEmail ?? 'N/A'}\``, inline: false },
+	];
+	const sanitizedFields = (payload.fields ?? []).map((f) => ({
+		...f,
+		value: truncateWebhookFieldValue(f.value),
+	}));
+	return {
+		title,
+		color,
+		fields: [...baseFields, ...sanitizedFields],
+		timestamp: new Date().toISOString(),
+		footer: { text: payload.footerText ?? 'NISE Worker' },
+	};
+}
+
+function notifyDiscordWebhook(webhookUrl: string, payload: WebhookPayload): Promise<void> {
+	const embed = buildDiscordEmbed(payload);
+	return fetch(webhookUrl, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ embeds: [embed] }),
+	}).then(() => undefined);
+}
+
+function fireErrorWebhook(
+	execCtx: ExecutionContext,
+	env: Env,
+	opts: { status: number; reason: string; path: string; referer: string; origin: string | null },
+): void {
+	const webhookUrl = env.WEBHOOK_DISCORD_URL;
+	if (!webhookUrl) return;
+	const payload: WebhookPayload = {
+		title: '🚨 Worker reject',
+		color: 0xff0000,
+		fields: [
+			{ name: 'Status', value: String(opts.status), inline: true },
+			{ name: 'Path', value: opts.path, inline: true },
+			{ name: 'Reason', value: opts.reason, inline: false },
+			{ name: 'Referer', value: opts.referer || '—', inline: false },
+			{ name: 'Origin', value: opts.origin || '—', inline: false },
+		],
+		footerText: 'NISE Worker',
+	};
+	execCtx.waitUntil(notifyDiscordWebhook(webhookUrl, payload));
+}
+
+function makeReject(
+	allowed: string,
+	referer: string,
+	env: Env,
+	execCtx: ExecutionContext,
+) {
 	return (ctx: ReqCtx, status: number, reason: string): Response => {
+		fireErrorWebhook(execCtx, env, {
+			status,
+			reason,
+			path: ctx.path,
+			referer,
+			origin: ctx.origin,
+		});
 		logEvent('request_rejected', ctx, status, reason);
 		const h = cors(ctx.origin, referer, allowed);
 		h.set('Content-Type', 'text/plain');
@@ -140,7 +224,7 @@ async function verifyToken(token: string, secret: string): Promise<VerifyResult>
 /* ===================== WORKER ===================== */
 
 export default {
-	async fetch(req: Request, env: Env): Promise<Response> {
+	async fetch(req: Request, env: Env, execCtx: ExecutionContext): Promise<Response> {
 		const origin = req.headers.get('Origin');
 		const referer = req.headers.get('Referer') || '';
 		const allowed = env.ALLOWED_ORIGIN;
@@ -153,7 +237,7 @@ export default {
 			range: req.headers.get('Range'),
 		};
 
-		const reject = makeReject(allowed, referer);
+		const reject = makeReject(allowed, referer, env, execCtx);
 
 		try {
 			const { path } = ctx;
@@ -280,6 +364,13 @@ export default {
 		} catch (error) {
 			const message = error instanceof Error ? `${error.name}: ${error.message}` : 'Unknown error';
 
+			fireErrorWebhook(execCtx, env, {
+				status: 500,
+				reason: message,
+				path: ctx.path,
+				referer,
+				origin,
+			});
 			logEvent('worker_error', ctx, 500, message);
 
 			return resp(message, 500, origin, referer, allowed, {

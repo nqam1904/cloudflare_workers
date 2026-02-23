@@ -37,11 +37,16 @@ function logEvent(event: string, ctx: ReqCtx, status: number, reason?: string): 
 
 /* ===================== CORS ===================== */
 
-function cors(origin: string | null, allowed: string): Headers {
+function isAllowedOrigin(origin: string | null, referer: string, allowed: string): boolean {
+	return origin === allowed || referer.startsWith(allowed);
+}
+
+function cors(origin: string | null, referer: string, allowed: string): Headers {
 	const h = new Headers();
 
-	if (origin === allowed) {
-		h.set('Access-Control-Allow-Origin', allowed);
+	if (isAllowedOrigin(origin, referer, allowed)) {
+		h.set('Access-Control-Allow-Origin', origin || allowed);
+		h.set('Access-Control-Allow-Credentials', 'true');
 	}
 
 	h.set('Vary', 'Origin');
@@ -52,17 +57,17 @@ function cors(origin: string | null, allowed: string): Headers {
 	return h;
 }
 
-function makeReject(allowed: string) {
+function makeReject(allowed: string, referer: string) {
 	return (ctx: ReqCtx, status: number, reason: string): Response => {
 		logEvent('request_rejected', ctx, status, reason);
-		const h = cors(ctx.origin, allowed);
+		const h = cors(ctx.origin, referer, allowed);
 		h.set('Content-Type', 'text/plain');
 		return new Response(reason, { status, headers: h });
 	};
 }
 
-function resp(body: BodyInit | null, status: number, origin: string | null, allowed: string, extra?: HeadersInit) {
-	const h = cors(origin, allowed);
+function resp(body: BodyInit | null, status: number, origin: string | null, referer: string, allowed: string, extra?: HeadersInit) {
+	const h = cors(origin, referer, allowed);
 	if (extra) new Headers(extra).forEach((v, k) => h.set(k, v));
 	return new Response(body, { status, headers: h });
 }
@@ -148,7 +153,7 @@ export default {
 			range: req.headers.get('Range'),
 		};
 
-		const reject = makeReject(allowed);
+		const reject = makeReject(allowed, referer);
 
 		try {
 			const { path } = ctx;
@@ -156,7 +161,7 @@ export default {
 			/* ===== OPTIONS ===== */
 			if (req.method === 'OPTIONS') {
 				logEvent('preflight', ctx, 204);
-				return resp('OK', 204, origin, allowed);
+				return resp('OK', 204, origin, referer, allowed);
 			}
 
 			/* ===== ORIGIN CHECK ===== */
@@ -164,7 +169,7 @@ export default {
 				return reject(ctx, 403, 'missing_origin');
 			}
 
-			if (!(origin === allowed || referer.startsWith(allowed))) {
+			if (!isAllowedOrigin(origin, referer, allowed)) {
 				return reject(ctx, 403, 'origin_not_allowed');
 			}
 
@@ -195,7 +200,7 @@ export default {
 
 				logEvent('manifest_served', ctx, 200);
 
-				return resp(playlist, 200, origin, allowed, {
+				return resp(playlist, 200, origin, referer, allowed, {
 					'Content-Type': 'application/vnd.apple.mpegurl',
 					'Cache-Control': 'no-store',
 				});
@@ -248,7 +253,7 @@ export default {
 				return reject(ctx, 404, 'file_not_found');
 			}
 
-			const headers = cors(origin, allowed);
+			const headers = cors(origin, referer, allowed);
 			obj.writeHttpMetadata(headers);
 			headers.set('Accept-Ranges', 'bytes');
 
@@ -277,7 +282,7 @@ export default {
 
 			logEvent('worker_error', ctx, 500, message);
 
-			return resp(message, 500, origin, allowed, {
+			return resp(message, 500, origin, referer, allowed, {
 				'Content-Type': 'text/plain',
 			});
 		}

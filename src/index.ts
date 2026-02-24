@@ -104,7 +104,7 @@ function notifyDiscordWebhook(webhookUrl: string, payload: WebhookPayload): Prom
 function fireErrorWebhook(
 	execCtx: ExecutionContext,
 	env: Env,
-	opts: { status: number; reason: string; referer: string; origin: string | null; ctx: ReqCtx },
+	opts: { status: number; reason: string; referer: string; origin: string | null; ctx: ReqCtx; req?: any },
 ): void {
 	const webhookUrl = env.WEBHOOK_DISCORD_URL;
 	if (!webhookUrl) return;
@@ -117,13 +117,31 @@ function fireErrorWebhook(
 			{ name: 'Referer', value: opts.referer || '—', inline: false },
 			{ name: 'Origin', value: opts.origin || '—', inline: false },
 			{ name: 'Context', value: JSON.stringify(opts.ctx), inline: false },
+			{ name: 'Request', value: JSON.stringify(opts.req), inline: false },
 		],
 		footerText: 'NISE Worker',
 	};
 	execCtx.waitUntil(notifyDiscordWebhook(webhookUrl, payload));
 }
 
-function makeReject(origin: string, allowed: string, referer: string, env: Env, execCtx: ExecutionContext) {
+function fireErrorVerifyTokenWebhook(execCtx: any, token: any, secret: any, env: any, message: any, payloadVerifyToken: any): void {
+	const webhookUrl = env.WEBHOOK_DISCORD_URL;
+	if (!webhookUrl) return;
+	const payload: WebhookPayload = {
+		title: `🚨 ${message}`,
+		color: 0xff0000,
+		fields: [
+			{ name: 'Token', value: token || '—', inline: false },
+			{ name: 'Secret', value: secret || '—', inline: false },
+			{ name: 'Message', value: message || '—', inline: false },
+			{ name: 'payloadVerifyToken', value: JSON.stringify(payloadVerifyToken), inline: false },
+		],
+		footerText: 'NISE Worker',
+	};
+	execCtx.waitUntil(notifyDiscordWebhook(webhookUrl, payload));
+}
+
+function makeReject(origin: string, allowed: string, referer: string, env: Env, execCtx: ExecutionContext, req: any) {
 	return (ctx: ReqCtx, status: number, reason: string): Response => {
 		fireErrorWebhook(execCtx, env, {
 			status,
@@ -131,6 +149,7 @@ function makeReject(origin: string, allowed: string, referer: string, env: Env, 
 			referer,
 			origin,
 			ctx,
+			req,
 		});
 		logEvent('request_rejected', ctx, status, reason);
 		const h = cors(origin, referer, allowed);
@@ -180,11 +199,12 @@ async function sign(body: string, secret: string): Promise<string> {
 	return b64uEncode(`${body}.${sig}`);
 }
 
-async function verifyToken(token: string, secret: string): Promise<VerifyResult> {
+async function verifyToken(token: string, secret: string, execCtx: ExecutionContext, env: Env): Promise<VerifyResult> {
 	try {
 		const decoded = b64uDecode(token);
 		const [json, sig] = decoded.split('.');
 		if (!json || !sig) {
+			fireErrorVerifyTokenWebhook(execCtx, token, secret, env, 'malformed_token', { json, sig });
 			return { ok: false, reason: 'malformed_token' };
 		}
 
@@ -195,17 +215,22 @@ async function verifyToken(token: string, secret: string): Promise<VerifyResult>
 		const expected = [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('');
 
 		if (!safeEqual(expected, sig)) {
+			fireErrorVerifyTokenWebhook(execCtx, token, secret, env, 'bad_signature', { expected, sig });
 			return { ok: false, reason: 'bad_signature' };
 		}
 
 		const payload = JSON.parse(json) as TokenPayload;
 
 		if (payload.exp !== undefined && payload.exp <= Math.floor(Date.now() / 1000)) {
+			fireErrorVerifyTokenWebhook(execCtx, token, secret, env, 'token_expired', { payload });
 			return { ok: false, reason: 'token_expired' };
 		}
 
 		return { ok: true, payload };
-	} catch {
+	} catch (err: unknown) {
+		fireErrorVerifyTokenWebhook(execCtx, token, secret, env, `decode_error: ${err instanceof Error ? err.message : 'Unknown error'}`, {
+			err,
+		});
 		return { ok: false, reason: 'decode_error' };
 	}
 }
@@ -226,7 +251,7 @@ export default {
 			range: req.headers.get('Range'),
 		};
 
-		const reject = makeReject(origin || '', allowed, referer, env, execCtx);
+		const reject = makeReject(origin || '', allowed, referer, env, execCtx, req);
 
 		try {
 			const { path } = ctx;
@@ -253,7 +278,7 @@ export default {
 					return reject(ctx, 403, 'missing_video_token');
 				}
 
-				const result = await verifyToken(token, env.VIDEO_TOKEN_SECRET);
+				const result = await verifyToken(token, env.VIDEO_TOKEN_SECRET, execCtx, env);
 
 				if (!result.ok) {
 					return reject(ctx, 403, result.reason);
@@ -286,7 +311,7 @@ export default {
 					return reject(ctx, 403, 'missing_segment_token');
 				}
 
-				const result = await verifyToken(st, env.VIDEO_TOKEN_SECRET);
+				const result = await verifyToken(st, env.VIDEO_TOKEN_SECRET, execCtx, env);
 
 				if (!result.ok) {
 					return reject(ctx, 403, `seg_${result.reason}`);
@@ -359,6 +384,7 @@ export default {
 				referer,
 				origin,
 				ctx,
+				req,
 			});
 			logEvent('worker_error', ctx, 500, message);
 

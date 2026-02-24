@@ -79,12 +79,6 @@ type WebhookPayload = {
 function buildDiscordEmbed(payload: WebhookPayload): object {
 	const title = payload.title ?? 'Notification';
 	const color = typeof payload.color === 'number' ? payload.color : 0xff0000;
-	const nodeEnv = (payload.nodeEnv || 'unknown').toUpperCase();
-	const envEmoji = nodeEnv === 'PRODUCTION' ? '🔴' : nodeEnv === 'DEVELOPMENT' ? '🟢' : '🟡';
-	const baseFields: Array<{ name: string; value: string; inline?: boolean }> = [
-		{ name: '🏷️ Environment', value: `${envEmoji} **${nodeEnv}**`, inline: false },
-		{ name: '👤 User', value: `ID: \`${payload.userId ?? 'N/A'}\`\nEmail: \`${payload.userEmail ?? 'N/A'}\``, inline: false },
-	];
 	const sanitizedFields = (payload.fields ?? []).map((f) => ({
 		...f,
 		value: truncateWebhookFieldValue(f.value),
@@ -92,7 +86,7 @@ function buildDiscordEmbed(payload: WebhookPayload): object {
 	return {
 		title,
 		color,
-		fields: [...baseFields, ...sanitizedFields],
+		fields: [...sanitizedFields],
 		timestamp: new Date().toISOString(),
 		footer: { text: payload.footerText ?? 'NISE Worker' },
 	};
@@ -110,7 +104,7 @@ function notifyDiscordWebhook(webhookUrl: string, payload: WebhookPayload): Prom
 function fireErrorWebhook(
 	execCtx: ExecutionContext,
 	env: Env,
-	opts: { status: number; reason: string; path: string; referer: string; origin: string | null },
+	opts: { status: number; reason: string; referer: string; origin: string | null; ctx: ReqCtx },
 ): void {
 	const webhookUrl = env.WEBHOOK_DISCORD_URL;
 	if (!webhookUrl) return;
@@ -118,33 +112,28 @@ function fireErrorWebhook(
 		title: '🚨 Worker reject',
 		color: 0xff0000,
 		fields: [
-			{ name: 'Status', value: String(opts.status), inline: true },
-			{ name: 'Path', value: opts.path, inline: true },
+			{ name: 'Status', value: String(opts.status), inline: false },
 			{ name: 'Reason', value: opts.reason, inline: false },
 			{ name: 'Referer', value: opts.referer || '—', inline: false },
 			{ name: 'Origin', value: opts.origin || '—', inline: false },
+			{ name: 'Context', value: JSON.stringify(opts.ctx), inline: false },
 		],
 		footerText: 'NISE Worker',
 	};
 	execCtx.waitUntil(notifyDiscordWebhook(webhookUrl, payload));
 }
 
-function makeReject(
-	allowed: string,
-	referer: string,
-	env: Env,
-	execCtx: ExecutionContext,
-) {
+function makeReject(origin: string, allowed: string, referer: string, env: Env, execCtx: ExecutionContext) {
 	return (ctx: ReqCtx, status: number, reason: string): Response => {
 		fireErrorWebhook(execCtx, env, {
 			status,
 			reason,
-			path: ctx.path,
 			referer,
-			origin: ctx.origin,
+			origin,
+			ctx,
 		});
 		logEvent('request_rejected', ctx, status, reason);
-		const h = cors(ctx.origin, referer, allowed);
+		const h = cors(origin, referer, allowed);
 		h.set('Content-Type', 'text/plain');
 		return new Response(reason, { status, headers: h });
 	};
@@ -237,7 +226,7 @@ export default {
 			range: req.headers.get('Range'),
 		};
 
-		const reject = makeReject(allowed, referer, env, execCtx);
+		const reject = makeReject(origin || '', allowed, referer, env, execCtx);
 
 		try {
 			const { path } = ctx;
@@ -367,9 +356,9 @@ export default {
 			fireErrorWebhook(execCtx, env, {
 				status: 500,
 				reason: message,
-				path: ctx.path,
 				referer,
 				origin,
+				ctx,
 			});
 			logEvent('worker_error', ctx, 500, message);
 

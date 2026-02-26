@@ -263,14 +263,15 @@ export default {
 			}
 
 			/* ===== ORIGIN CHECK ===== */
-			if (!origin && !referer) {
-				return reject(ctx, 403, 'missing_origin');
-			}
+			if (path.endsWith('.m3u8')) {
+				if (!origin && !referer) {
+					return reject(ctx, 403, 'missing_origin');
+				}
 
-			if (!isAllowedOrigin(origin, referer, allowed)) {
-				return reject(ctx, 403, 'origin_not_allowed');
+				if (!isAllowedOrigin(origin, referer, allowed)) {
+					return reject(ctx, 403, 'origin_not_allowed');
+				}
 			}
-
 			/* ===== MANIFEST (.m3u8) ===== */
 			if (path.endsWith('.m3u8')) {
 				const token = url.searchParams.get('token');

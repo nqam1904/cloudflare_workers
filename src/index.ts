@@ -1,14 +1,16 @@
-const DISCORD_FIELD_VALUE_LIMIT = 1000;
+/* ===================== CONSTANTS ===================== */
 
-function truncateWebhookFieldValue(value: string): string {
-	return value.slice(0, DISCORD_FIELD_VALUE_LIMIT);
-}
+const DISCORD_FIELD_VALUE_LIMIT = 1000;
+const SEGMENT_TOKEN_TTL_SECONDS = 60 * 60 * 6; // 6 hours
+
+/* ===================== ENV ===================== */
 
 export interface Env {
 	VIDEO_TOKEN_SECRET: string;
 	R2_BUCKET: R2Bucket;
 	ALLOWED_ORIGIN: string;
 	WEBHOOK_DISCORD_URL?: string;
+	BACKEND_API_URL: string;
 }
 
 /* ===================== TYPES ===================== */
@@ -19,147 +21,260 @@ type TokenPayload = {
 	[k: string]: unknown;
 };
 
+/**
+ * Extended context — carries all request metadata through the entire lifecycle.
+ * Every log and webhook call receives this, so debug info is always complete.
+ */
 type ReqCtx = {
 	path: string;
 	origin: string | null;
+	referer: string;
+	userAgent: string;
 	range: string | null;
+	clientIp: string;
+	country: string;
 };
 
 type VerifyResult = { ok: true; payload: TokenPayload } | { ok: false; reason: string };
 
 /* ===================== LOGGING ===================== */
 
-function logEvent(event: string, ctx: ReqCtx, status: number, reason?: string): void {
-	const payload: any = {
+type LogLevel = 'info' | 'warn' | 'error';
+
+type LogEventName = 'preflight' | 'manifest_served' | 'r2_served' | 'request_rejected' | 'worker_error' | 'token_verify_failed';
+
+type LogPayload = {
+	event: LogEventName;
+	level: LogLevel;
+	status: number;
+	path: string;
+	origin: string | null;
+	referer: string;
+	userAgent: string;
+	clientIp: string;
+	country: string;
+	range: string | null;
+	reason?: string;
+	detail?: string;
+};
+
+function logEvent(event: LogEventName, level: LogLevel, ctx: ReqCtx, status: number, reason?: string, detail?: string): void {
+	const payload: LogPayload = {
 		event,
+		level,
+		status,
 		path: ctx.path,
 		origin: ctx.origin,
+		referer: ctx.referer || '—',
+		userAgent: ctx.userAgent || '—',
+		clientIp: ctx.clientIp || '—',
+		country: ctx.country || '—',
 		range: ctx.range,
-		status,
 	};
-
 	if (reason) payload.reason = reason;
-	console.log(JSON.stringify(payload));
+	if (detail) payload.detail = detail;
+
+	if (level === 'error') console.error(JSON.stringify(payload));
+	else if (level === 'warn') console.warn(JSON.stringify(payload));
+	else console.log(JSON.stringify(payload));
 }
 
 /* ===================== CORS ===================== */
 
-function isAllowedOrigin(origin: string | null, referer: string, allowed: string): boolean {
-	return origin === allowed || referer.startsWith(allowed);
+function normalizeOrigin(value: string | null): string | null {
+	if (!value) return null;
+	try {
+		// URL.origin normalizes protocol/host/port and removes trailing slash/path/query.
+		return new URL(value.trim()).origin.toLowerCase();
+	} catch {
+		// Fallback for non-standard values (rare) — still remove trailing slash.
+		return value.trim().replace(/\/+$/, '').toLowerCase();
+	}
 }
 
-function cors(origin: string | null, referer: string, allowed: string): Headers {
-	const h = new Headers();
+function parseAllowedOrigins(raw: string): string[] {
+	return raw
+		.split(',')
+		.map((v) => normalizeOrigin(v))
+		.filter((v): v is string => Boolean(v));
+}
 
-	if (isAllowedOrigin(origin, referer, allowed)) {
-		h.set('Access-Control-Allow-Origin', origin || allowed);
-		h.set('Access-Control-Allow-Credentials', 'true');
+function resolveAllowedRequestOrigin(origin: string | null, referer: string, allowedRaw: string): string | null {
+	const allowedOrigins = parseAllowedOrigins(allowedRaw);
+	if (allowedOrigins.length === 0) return null;
+
+	const normalizedOrigin = normalizeOrigin(origin);
+	if (normalizedOrigin && allowedOrigins.includes(normalizedOrigin)) {
+		return normalizedOrigin;
 	}
 
+	const refererOrigin = normalizeOrigin(referer);
+	if (refererOrigin && allowedOrigins.includes(refererOrigin)) {
+		return refererOrigin;
+	}
+
+	return null;
+}
+
+function isAllowedOrigin(origin: string | null, referer: string, allowedRaw: string): boolean {
+	return resolveAllowedRequestOrigin(origin, referer, allowedRaw) !== null;
+}
+
+function cors(origin: string | null, referer: string, allowedRaw: string): Headers {
+	const h = new Headers();
+	const matchedOrigin = resolveAllowedRequestOrigin(origin, referer, allowedRaw);
+	if (matchedOrigin) {
+		h.set('Access-Control-Allow-Origin', matchedOrigin);
+		h.set('Access-Control-Allow-Credentials', 'true');
+	}
 	h.set('Vary', 'Origin');
 	h.set('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
 	h.set('Access-Control-Allow-Headers', 'Content-Type, Range');
 	h.set('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Accept-Ranges');
-
 	return h;
 }
 
-/* ===================== DISCORD WEBHOOK ===================== */
+/* ===================== DISCORD WEBHOOK (unified) ===================== */
 
-type WebhookPayload = {
-	title?: string;
-	color?: number;
-	fields?: Array<{ name: string; value: string; inline?: boolean }>;
-	footerText?: string;
-	userId?: string;
-	userEmail?: string;
-	nodeEnv?: string;
-};
+type DiscordColor = number;
+const COLOR_RED: DiscordColor = 0xff0000;
+const COLOR_ORANGE: DiscordColor = 0xff8800;
+const COLOR_YELLOW: DiscordColor = 0xffcc00;
 
-function buildDiscordEmbed(payload: WebhookPayload): object {
-	const title = payload.title ?? 'Notification';
-	const color = typeof payload.color === 'number' ? payload.color : 0xff0000;
-	const sanitizedFields = (payload.fields ?? []).map((f) => ({
-		...f,
-		value: truncateWebhookFieldValue(f.value),
-	}));
-	return {
+type WebhookEvent =
+	| { kind: 'request_rejected'; ctx: ReqCtx; status: number; reason: string }
+	| { kind: 'token_verify_failed'; ctx: ReqCtx; tokenPrefix: string; reason: string; diag: Record<string, unknown> }
+	| { kind: 'worker_error'; ctx: ReqCtx; error: string };
+
+/**
+ * Single unified webhook dispatcher.
+ * All Discord notifications go through here — no more scattered fire* functions.
+ *
+ * Color scheme:
+ *   🔴 request_rejected  — 403/404 from origin/token issues
+ *   🟠 token_verify_failed — bad sig / expired / malformed
+ *   🟡 worker_error        — unexpected 500
+ */
+function fireWebhook(execCtx: ExecutionContext, env: Env, event: WebhookEvent): void {
+	const webhookUrl = env.WEBHOOK_DISCORD_URL;
+	if (!webhookUrl) return;
+
+	let title: string;
+	let color: DiscordColor;
+	let fields: Array<{ name: string; value: string; inline?: boolean }>;
+
+	// Common request context fields — always included for traceability
+	const ctxFields = (ctx: ReqCtx) => [
+		{ name: 'Path', value: ctx.path || '—', inline: true },
+		{ name: 'Origin', value: ctx.origin || '—', inline: true },
+		{ name: 'Referer', value: ctx.referer || '—', inline: false },
+		{ name: 'User-Agent', value: ctx.userAgent || '—', inline: false },
+		{ name: 'Client IP', value: ctx.clientIp || '—', inline: true },
+		{ name: 'Country', value: ctx.country || '—', inline: true },
+		{ name: 'Range', value: ctx.range || 'none', inline: true },
+	];
+
+	switch (event.kind) {
+		case 'request_rejected':
+			title = `🚨 [${event.status}] Request rejected`;
+			color = COLOR_RED;
+			fields = [
+				{ name: 'Reason', value: event.reason, inline: false },
+				{ name: 'Status', value: String(event.status), inline: true },
+				...ctxFields(event.ctx),
+			];
+			break;
+
+		case 'token_verify_failed':
+			title = `🟠 Token verify failed: ${event.reason}`;
+			color = COLOR_ORANGE;
+			fields = [
+				{ name: 'Reason', value: event.reason, inline: false },
+				{ name: 'Token (prefix)', value: event.tokenPrefix || '—', inline: true },
+				{ name: 'Diagnostic', value: JSON.stringify(event.diag).slice(0, 500), inline: false },
+				...ctxFields(event.ctx),
+			];
+			break;
+
+		case 'worker_error':
+			title = '🟡 Worker uncaught error';
+			color = COLOR_YELLOW;
+			fields = [{ name: 'Error', value: event.error.slice(0, 500), inline: false }, ...ctxFields(event.ctx)];
+			break;
+	}
+
+	const embed = {
 		title,
 		color,
-		fields: [...sanitizedFields],
+		fields: fields.map((f) => ({ ...f, value: f.value.slice(0, DISCORD_FIELD_VALUE_LIMIT) })),
 		timestamp: new Date().toISOString(),
-		footer: { text: payload.footerText ?? 'NISE Worker' },
+		footer: { text: 'NISE Worker' },
 	};
+
+	execCtx.waitUntil(
+		fetch(webhookUrl, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ embeds: [embed] }),
+		}).then(() => undefined),
+	);
 }
 
-function notifyDiscordWebhook(webhookUrl: string, payload: WebhookPayload): Promise<void> {
-	const embed = buildDiscordEmbed(payload);
-	return fetch(webhookUrl, {
-		method: 'POST',
-		headers: { 'Content-Type': 'application/json' },
-		body: JSON.stringify({ embeds: [embed] }),
-	}).then(() => undefined);
-}
+/* ===================== FORWARD TO BACKEND ===================== */
 
-function fireErrorWebhook(
-	execCtx: ExecutionContext,
-	env: Env,
-	opts: { status: number; reason: string; referer: string; origin: string | null; ctx: ReqCtx; req?: any },
-): void {
-	const webhookUrl = env.WEBHOOK_DISCORD_URL;
-	if (!webhookUrl) return;
-	const payload: WebhookPayload = {
-		title: '🚨 Worker reject',
-		color: 0xff0000,
-		fields: [
-			{ name: 'Status', value: String(opts.status), inline: false },
-			{ name: 'Reason', value: opts.reason, inline: false },
-			{ name: 'Referer', value: opts.referer || '—', inline: false },
-			{ name: 'Origin', value: opts.origin || '—', inline: false },
-			{ name: 'Context', value: JSON.stringify(opts.ctx), inline: false },
-			{ name: 'Request', value: JSON.stringify(opts.req), inline: false },
-		],
-		footerText: 'NISE Worker',
+function forwardToBackend(execCtx: ExecutionContext, env: Env, event: LogEventName, ctx: ReqCtx, status: number, reason?: string, detail?: string): void {
+	if (!env.BACKEND_API_URL) return;
+
+	const body = {
+		event,
+		status,
+		reason: reason || null,
+		detail: detail || null,
+		path: ctx.path,
+		origin: ctx.origin,
+		referer: ctx.referer || null,
+		userAgent: ctx.userAgent || null,
+		clientIp: ctx.clientIp || null,
+		country: ctx.country || null,
+		range: ctx.range || null,
+		videoId: extractVidFromPath(ctx.path),
+		timestamp: new Date().toISOString(),
 	};
-	execCtx.waitUntil(notifyDiscordWebhook(webhookUrl, payload));
+
+	execCtx.waitUntil(
+		fetch(`https://loveblender.online/api/worker-monitor/ingest`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify(body),
+		}).catch(() => {}),
+	);
 }
 
-function fireErrorVerifyTokenWebhook(execCtx: any, token: any, secret: any, env: any, message: any, payloadVerifyToken: any): void {
-	const webhookUrl = env.WEBHOOK_DISCORD_URL;
-	if (!webhookUrl) return;
-	const payload: WebhookPayload = {
-		title: `🚨 ${message}`,
-		color: 0xff0000,
-		fields: [
-			{ name: 'Token', value: token || '—', inline: false },
-			{ name: 'Secret', value: secret || '—', inline: false },
-			{ name: 'Message', value: message || '—', inline: false },
-			{ name: 'payloadVerifyToken', value: JSON.stringify(payloadVerifyToken), inline: false },
-		],
-		footerText: 'NISE Worker',
-	};
-	execCtx.waitUntil(notifyDiscordWebhook(webhookUrl, payload));
+function extractVidFromPath(path: string): string | null {
+	const parts = path.split('/').filter(Boolean);
+	// /course-videos/{vid}/hls/...
+	if (parts.length >= 2 && parts[0] === 'course-videos') {
+		return parts[1];
+	}
+	return null;
 }
 
-function makeReject(origin: string, allowed: string, referer: string, env: Env, execCtx: ExecutionContext, req: any) {
-	return (ctx: ReqCtx, status: number, reason: string): Response => {
-		fireErrorWebhook(execCtx, env, {
-			status,
-			reason,
-			referer,
-			origin,
-			ctx,
-			req,
-		});
-		logEvent('request_rejected', ctx, status, reason);
-		const h = cors(origin, referer, allowed);
+/* ===================== REJECT HELPER ===================== */
+
+function makeReject(ctx: ReqCtx, allowed: string, env: Env, execCtx: ExecutionContext) {
+	return (status: number, reason: string): Response => {
+		logEvent('request_rejected', status >= 500 ? 'error' : 'warn', ctx, status, reason);
+		fireWebhook(execCtx, env, { kind: 'request_rejected', ctx, status, reason });
+		forwardToBackend(execCtx, env, 'request_rejected', ctx, status, reason);
+
+		const h = cors(ctx.origin, ctx.referer, allowed);
 		h.set('Content-Type', 'text/plain');
 		return new Response(reason, { status, headers: h });
 	};
 }
 
-function resp(body: BodyInit | null, status: number, origin: string | null, referer: string, allowed: string, extra?: HeadersInit) {
-	const h = cors(origin, referer, allowed);
+function resp(body: BodyInit | null, status: number, ctx: ReqCtx, allowed: string, extra?: HeadersInit): Response {
+	const h = cors(ctx.origin, ctx.referer, allowed);
 	if (extra) new Headers(extra).forEach((v, k) => h.set(k, v));
 	return new Response(body, { status, headers: h });
 }
@@ -181,9 +296,7 @@ function b64uEncode(str: string): string {
 function safeEqual(a: string, b: string): boolean {
 	if (a.length !== b.length) return false;
 	let result = 0;
-	for (let i = 0; i < a.length; i++) {
-		result |= a.charCodeAt(i) ^ b.charCodeAt(i);
-	}
+	for (let i = 0; i < a.length; i++) result |= a.charCodeAt(i) ^ b.charCodeAt(i);
 	return result === 0;
 }
 
@@ -191,47 +304,72 @@ function safeEqual(a: string, b: string): boolean {
 
 async function sign(body: string, secret: string): Promise<string> {
 	const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
-
 	const buf = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(body));
-
 	const sig = [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('');
-
 	return b64uEncode(`${body}.${sig}`);
 }
 
-async function verifyToken(token: string, secret: string, execCtx: ExecutionContext, env: Env): Promise<VerifyResult> {
+/**
+ * ctx is passed in so that token errors include origin + referer in Discord notifications.
+ * Previously token errors had NO request context — impossible to trace which user/page triggered it.
+ */
+async function verifyToken(token: string, secret: string, ctx: ReqCtx, execCtx: ExecutionContext, env: Env): Promise<VerifyResult> {
+	const tokenPrefix = token ? `${token.slice(0, 20)}…` : '—';
+
+	const fail = (reason: string, diag: Record<string, unknown> = {}): VerifyResult => {
+		logEvent('token_verify_failed', 'warn', ctx, 403, reason);
+		fireWebhook(execCtx, env, { kind: 'token_verify_failed', ctx, tokenPrefix, reason, diag });
+		forwardToBackend(execCtx, env, 'token_verify_failed', ctx, 403, reason, JSON.stringify(diag).slice(0, 500));
+		return { ok: false, reason };
+	};
+
 	try {
 		const decoded = b64uDecode(token);
-		const [json, sig] = decoded.split('.');
-		if (!json || !sig) {
-			fireErrorVerifyTokenWebhook(execCtx, token, secret, env, 'malformed_token', { json, sig });
-			return { ok: false, reason: 'malformed_token' };
-		}
+
+		// [FIX] lastIndexOf instead of split('.') — JSON body can contain decimal dots
+		const lastDot = decoded.lastIndexOf('.');
+		if (lastDot === -1) return fail('malformed_token', { decoded: decoded.slice(0, 80) });
+
+		const json = decoded.slice(0, lastDot);
+		const sig = decoded.slice(lastDot + 1);
+		if (!json || !sig) return fail('malformed_token', { hasJson: !!json, hasSig: !!sig });
 
 		const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
-
 		const buf = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(json));
-
 		const expected = [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('');
 
-		if (!safeEqual(expected, sig)) {
-			fireErrorVerifyTokenWebhook(execCtx, token, secret, env, 'bad_signature', { expected, sig });
-			return { ok: false, reason: 'bad_signature' };
-		}
+		// Never log full sig — only short prefix for correlation
+		if (!safeEqual(expected, sig)) return fail('bad_signature', { sigPrefix: sig.slice(0, 8) });
 
 		const payload = JSON.parse(json) as TokenPayload;
 
 		if (payload.exp !== undefined && payload.exp <= Math.floor(Date.now() / 1000)) {
-			fireErrorVerifyTokenWebhook(execCtx, token, secret, env, 'token_expired', { payload });
-			return { ok: false, reason: 'token_expired' };
+			const expiredAt = new Date(payload.exp * 1000);
+			const formatted = expiredAt.toLocaleString('vi-VN', {
+				day: '2-digit',
+				month: '2-digit',
+				year: 'numeric',
+				hour: '2-digit',
+				minute: '2-digit',
+				hour12: false,
+			});
+			return fail('token_expired', {
+				vid: payload.vid,
+				expiredAt: formatted,
+				serverTime: new Date().toLocaleString('vi-VN', {
+					day: '2-digit',
+					month: '2-digit',
+					year: 'numeric',
+					hour: '2-digit',
+					minute: '2-digit',
+					hour12: false,
+				}),
+			});
 		}
 
 		return { ok: true, payload };
 	} catch (err: unknown) {
-		fireErrorVerifyTokenWebhook(execCtx, token, secret, env, `decode_error: ${err instanceof Error ? err.message : 'Unknown error'}`, {
-			err,
-		});
-		return { ok: false, reason: 'decode_error' };
+		return fail(`decode_error: ${err instanceof Error ? err.message : 'Unknown'}`, {});
 	}
 }
 
@@ -239,67 +377,75 @@ async function verifyToken(token: string, secret: string, execCtx: ExecutionCont
 
 export default {
 	async fetch(req: Request, env: Env, execCtx: ExecutionContext): Promise<Response> {
+		const url = new URL(req.url);
 		const origin = req.headers.get('Origin');
 		const referer = req.headers.get('Referer') || '';
+		const userAgent = req.headers.get('User-Agent') || '';
+		const clientIp = req.headers.get('CF-Connecting-IP') || req.headers.get('X-Forwarded-For') || '';
+		const country = (req.cf?.country as string) || '';
 		const allowed = env.ALLOWED_ORIGIN;
-
-		const url = new URL(req.url);
 
 		const ctx: ReqCtx = {
 			path: url.pathname,
 			origin,
+			referer,
+			userAgent,
 			range: req.headers.get('Range'),
+			clientIp,
+			country,
 		};
 
-		const reject = makeReject(origin || '', allowed, referer, env, execCtx, req);
+		// reject() is now ctx-aware — always includes origin + referer in logs & Discord
+		const reject = makeReject(ctx, allowed, env, execCtx);
 
 		try {
 			const { path } = ctx;
 
 			/* ===== OPTIONS ===== */
 			if (req.method === 'OPTIONS') {
-				logEvent('preflight', ctx, 204);
-				return resp('OK', 204, origin, referer, allowed);
+				logEvent('preflight', 'info', ctx, 204);
+				return resp('OK', 204, ctx, allowed);
 			}
 
 			/* ===== ORIGIN CHECK ===== */
 			if (path.endsWith('.m3u8')) {
 				if (!origin && !referer) {
-					return reject(ctx, 403, 'missing_origin');
+					return reject(403, 'missing_origin');
 				}
 
 				if (!isAllowedOrigin(origin, referer, allowed)) {
-					return reject(ctx, 403, 'origin_not_allowed');
+					return reject(403, 'origin_not_allowed');
 				}
 			}
+
 			/* ===== MANIFEST (.m3u8) ===== */
 			if (path.endsWith('.m3u8')) {
 				const token = url.searchParams.get('token');
-				if (!token) {
-					return reject(ctx, 403, 'missing_video_token');
-				}
+				if (!token) return reject(403, 'missing_video_token');
 
-				const result = await verifyToken(token, env.VIDEO_TOKEN_SECRET, execCtx, env);
-
-				if (!result.ok) {
-					return reject(ctx, 403, result.reason);
-				}
+				const result = await verifyToken(token, env.VIDEO_TOKEN_SECRET, ctx, execCtx, env);
+				if (!result.ok) return reject(403, result.reason);
 
 				const r2Key = path.slice(1);
 				const obj = await env.R2_BUCKET.get(r2Key);
-				if (!obj) {
-					return reject(ctx, 404, 'manifest_not_found');
-				}
+				if (!obj) return reject(404, 'manifest_not_found');
 
-				const segToken = await sign(JSON.stringify({ vid: result.payload.vid }), env.VIDEO_TOKEN_SECRET);
+				// Segment token: short-lived (6h), bound to vid
+				const segToken = await sign(
+					JSON.stringify({
+						vid: result.payload.vid,
+						exp: Math.floor(Date.now() / 1000) + SEGMENT_TOKEN_TTL_SECONDS,
+					}),
+					env.VIDEO_TOKEN_SECRET,
+				);
 
 				let playlist = await obj.text();
-
+				// Append ?st=<token> to every .ts line in the playlist
 				playlist = playlist.replace(/^(?!#)(.+\.ts)$/gm, `$1?st=${segToken}`);
 
-				logEvent('manifest_served', ctx, 200);
+				logEvent('manifest_served', 'info', ctx, 200);
 
-				return resp(playlist, 200, origin, referer, allowed, {
+				return resp(playlist, 200, ctx, allowed, {
 					'Content-Type': 'application/vnd.apple.mpegurl',
 					'Cache-Control': 'no-store',
 				});
@@ -308,28 +454,21 @@ export default {
 			/* ===== SEGMENT (.ts) ===== */
 			if (path.endsWith('.ts')) {
 				const st = url.searchParams.get('st');
-				if (!st) {
-					return reject(ctx, 403, 'missing_segment_token');
-				}
+				if (!st) return reject(403, 'missing_segment_token');
 
-				const result = await verifyToken(st, env.VIDEO_TOKEN_SECRET, execCtx, env);
+				const result = await verifyToken(st, env.VIDEO_TOKEN_SECRET, ctx, execCtx, env);
+				if (!result.ok) return reject(403, `seg_${result.reason}`);
 
-				if (!result.ok) {
-					return reject(ctx, 403, `seg_${result.reason}`);
-				}
-
-				// Extract vid from path:
-				// /course-videos/{vid}/hls/seg_xxx.ts
+				// Path structure: /course-videos/{vid}/hls/seg_xxx.ts
 				const parts = path.split('/').filter(Boolean);
 				const pathVid = parts.length >= 2 ? parts[1] : null;
 
 				if (!result.payload.vid || result.payload.vid !== pathVid) {
-					return reject(ctx, 403, 'seg_vid_mismatch');
+					return reject(403, 'seg_vid_mismatch');
 				}
 			}
 
-			/* ===== RANGE SUPPORT ===== */
-
+			/* ===== R2 FETCH + RANGE SUPPORT ===== */
 			const rangeHeader = req.headers.get('Range');
 			let range: R2Range | undefined;
 
@@ -338,19 +477,13 @@ export default {
 				if (m) {
 					const start = parseInt(m[1], 10);
 					const end = m[2] ? parseInt(m[2], 10) : undefined;
-					range = {
-						offset: start,
-						length: end ? end - start + 1 : undefined,
-					};
+					range = { offset: start, length: end !== undefined ? end - start + 1 : undefined };
 				}
 			}
 
 			const r2Key = path.slice(1);
 			const obj = await env.R2_BUCKET.get(r2Key, range ? { range } : undefined);
-
-			if (!obj) {
-				return reject(ctx, 404, 'file_not_found');
-			}
+			if (!obj) return reject(404, 'file_not_found');
 
 			const headers = cors(origin, referer, allowed);
 			obj.writeHttpMetadata(headers);
@@ -362,36 +495,36 @@ export default {
 			}
 
 			if (range && obj.range) {
-				// @ts-ignore
-				const off = obj.range.offset ?? 0;
-				// @ts-ignore
-				const len = obj.range.length ?? obj.size;
+				const off = (obj.range as { offset?: number }).offset ?? 0;
+				const len = (obj.range as { length?: number }).length ?? obj.size;
 				headers.set('Content-Range', `bytes ${off}-${off + len - 1}/${obj.size}`);
 			}
 
 			const status = range ? 206 : 200;
-			logEvent('r2_served', ctx, status);
+			logEvent('r2_served', 'info', ctx, status);
 
-			return new Response(obj.body, {
-				status,
-				headers,
-			});
+			// .ts segments: immutable → cache at Cloudflare edge PoP
+			// Cache key = path only (strip ?st=... token so all users share the same cache entry)
+			if (path.endsWith('.ts')) {
+				return new Response(obj.body, {
+					status,
+					headers,
+					// @ts-ignore — Cloudflare Workers cf property
+					cf: {
+						cacheEverything: true,
+						cacheTtl: 31536000,
+						cacheKey: path,
+					},
+				});
+			}
+
+			return new Response(obj.body, { status, headers });
 		} catch (error) {
 			const message = error instanceof Error ? `${error.name}: ${error.message}` : 'Unknown error';
-
-			fireErrorWebhook(execCtx, env, {
-				status: 500,
-				reason: message,
-				referer,
-				origin,
-				ctx,
-				req,
-			});
-			logEvent('worker_error', ctx, 500, message);
-
-			return resp(message, 500, origin, referer, allowed, {
-				'Content-Type': 'text/plain',
-			});
+			logEvent('worker_error', 'error', ctx, 500, message);
+			fireWebhook(execCtx, env, { kind: 'worker_error', ctx, error: message });
+			forwardToBackend(execCtx, env, 'worker_error', ctx, 500, message);
+			return resp(message, 500, ctx, allowed, { 'Content-Type': 'text/plain' });
 		}
 	},
 };

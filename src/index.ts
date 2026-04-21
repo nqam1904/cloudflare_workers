@@ -16,7 +16,15 @@ export interface Env {
 type TokenPayload = {
 	vid: string;
 	exp?: number;
+	userId?: string;
+	email?: string;
+	ip?: string;
 	[k: string]: unknown;
+};
+
+type UserIdentity = {
+	userId?: string;
+	email?: string;
 };
 
 type ReqCtx = {
@@ -104,17 +112,34 @@ function notifyDiscordWebhook(webhookUrl: string, payload: WebhookPayload): Prom
 	}).then(() => undefined);
 }
 
+function buildUserIdentityFields(identity: UserIdentity): Array<{ name: string; value: string; inline?: boolean }> {
+	return [
+		{ name: '👤 User ID', value: identity.userId || '—', inline: true },
+		{ name: '📧 Email', value: identity.email || '—', inline: true },
+	];
+}
+
 function fireErrorWebhook(
 	execCtx: ExecutionContext,
 	env: Env,
-	opts: { status: number; reason: string; referer: string; origin: string | null; ctx: ReqCtx; req?: any },
+	opts: {
+		status: number;
+		reason: string;
+		referer: string;
+		origin: string | null;
+		ctx: ReqCtx;
+		req?: any;
+		identity?: UserIdentity;
+	},
 ): void {
 	const webhookUrl = env.WEBHOOK_DISCORD_URL;
 	if (!webhookUrl) return;
+	const identity = opts.identity ?? {};
 	const payload: WebhookPayload = {
 		title: '🚨 Worker reject',
 		color: 0xff0000,
 		fields: [
+			...buildUserIdentityFields(identity),
 			{ name: 'Status', value: String(opts.status), inline: false },
 			{ name: 'Reason', value: opts.reason, inline: false },
 			{ name: 'Referer', value: opts.referer || '—', inline: false },
@@ -130,10 +155,12 @@ function fireErrorWebhook(
 function fireErrorVerifyTokenWebhook(execCtx: any, token: any, secret: any, env: any, message: any, payloadVerifyToken: any): void {
 	const webhookUrl = env.WEBHOOK_DISCORD_URL;
 	if (!webhookUrl) return;
+	const identity = extractUserIdentity(tryDecodeTokenPayload(typeof token === 'string' ? token : undefined));
 	const payload: WebhookPayload = {
 		title: `🚨 ${message}`,
 		color: 0xff0000,
 		fields: [
+			...buildUserIdentityFields(identity),
 			{ name: 'Token', value: token || '—', inline: false },
 			{ name: 'Secret', value: secret || '—', inline: false },
 			{ name: 'Message', value: message || '—', inline: false },
@@ -144,7 +171,15 @@ function fireErrorVerifyTokenWebhook(execCtx: any, token: any, secret: any, env:
 	execCtx.waitUntil(notifyDiscordWebhook(webhookUrl, payload));
 }
 
-function makeReject(origin: string, allowed: string, referer: string, env: Env, execCtx: ExecutionContext, req: any) {
+function makeReject(
+	origin: string,
+	allowed: string,
+	referer: string,
+	env: Env,
+	execCtx: ExecutionContext,
+	req: any,
+	identity: UserIdentity,
+) {
 	return (ctx: ReqCtx, status: number, reason: string): Response => {
 		fireErrorWebhook(execCtx, env, {
 			status,
@@ -153,6 +188,7 @@ function makeReject(origin: string, allowed: string, referer: string, env: Env, 
 			origin,
 			ctx,
 			req,
+			identity,
 		});
 		logEvent('request_rejected', ctx, status, reason);
 		const h = cors(origin, referer, allowed);
@@ -173,6 +209,39 @@ function b64uDecode(str: string): string {
 	let b = str.replace(/-/g, '+').replace(/_/g, '/');
 	while (b.length % 4) b += '=';
 	return atob(b);
+}
+
+/**
+ * Best-effort token payload decoder (no signature verification).
+ * Used to enrich error webhooks with user identity (userId/email) even when
+ * the token is invalid/expired/tampered — we still want to know WHO hit the
+ * error in production monitoring.
+ */
+function tryDecodeTokenPayload(token: string | null | undefined): Partial<TokenPayload> | null {
+	if (!token) return null;
+	try {
+		const decoded = b64uDecode(token);
+		const lastDot = decoded.lastIndexOf('.');
+		if (lastDot === -1) return null;
+		const json = decoded.slice(0, lastDot);
+		if (!json) return null;
+		const parsed = JSON.parse(json) as Partial<TokenPayload>;
+		return parsed && typeof parsed === 'object' ? parsed : null;
+	} catch {
+		return null;
+	}
+}
+
+function extractUserIdentity(payload: Partial<TokenPayload> | null | undefined): UserIdentity {
+	if (!payload) return {};
+	const userId = typeof payload.userId === 'string' ? payload.userId : undefined;
+	const email = typeof payload.email === 'string' ? payload.email : undefined;
+	return { userId, email };
+}
+
+function extractUserIdentityFromUrl(url: URL): UserIdentity {
+	const token = url.searchParams.get('token') || url.searchParams.get('st');
+	return extractUserIdentity(tryDecodeTokenPayload(token));
 }
 
 function b64uEncode(str: string): string {
@@ -205,7 +274,18 @@ async function sign(body: string, secret: string): Promise<string> {
 async function verifyToken(token: string, secret: string, execCtx: ExecutionContext, env: Env): Promise<VerifyResult> {
 	try {
 		const decoded = b64uDecode(token);
-		const [json, sig] = decoded.split('.');
+
+		// NOTE: use lastIndexOf('.') instead of split('.') because the signed JSON
+		// payload can contain dots (e.g. `ip: "58.186.71.156"`), which would make
+		// split('.') chop the JSON into multiple pieces and mistake an IP octet
+		// for the signature. Keep this consistent with nise-be and nise-fe.
+		const lastDot = decoded.lastIndexOf('.');
+		if (lastDot === -1) {
+			fireErrorVerifyTokenWebhook(execCtx, token, secret, env, 'malformed_token', { decoded });
+			return { ok: false, reason: 'malformed_token' };
+		}
+		const json = decoded.slice(0, lastDot);
+		const sig = decoded.slice(lastDot + 1);
 		if (!json || !sig) {
 			fireErrorVerifyTokenWebhook(execCtx, token, secret, env, 'malformed_token', { json, sig });
 			return { ok: false, reason: 'malformed_token' };
@@ -255,7 +335,8 @@ export default {
 		};
 
 		const reqLog = { url: req.url, method: req.method, headers: Object.fromEntries(req.headers.entries()) };
-		const reject = makeReject(origin || '', allowed, referer, env, execCtx, reqLog);
+		const identity = extractUserIdentityFromUrl(url);
+		const reject = makeReject(origin || '', allowed, referer, env, execCtx, reqLog, identity);
 
 		try {
 			const { path } = ctx;
@@ -296,14 +377,16 @@ export default {
 				}
 
 				const clientIp = req.headers.get('cf-connecting-ip') || '';
-				const segToken = await sign(
-					JSON.stringify({
-						vid: result.payload.vid,
-						ip: clientIp,
-						exp: Math.floor(Date.now() / 1000) + 60 * 60 * 4,
-					}),
-					env.VIDEO_TOKEN_SECRET,
-				);
+				// Forward user identity from the m3u8 payload so segment-level
+				// webhooks can attribute errors to the right user.
+				const segPayload: Record<string, unknown> = {
+					vid: result.payload.vid,
+					ip: clientIp,
+					exp: Math.floor(Date.now() / 1000) + 60 * 60 * 4,
+				};
+				if (typeof result.payload.userId === 'string') segPayload.userId = result.payload.userId;
+				if (typeof result.payload.email === 'string') segPayload.email = result.payload.email;
+				const segToken = await sign(JSON.stringify(segPayload), env.VIDEO_TOKEN_SECRET);
 
 				let playlist = await obj.text();
 
@@ -418,6 +501,7 @@ export default {
 				origin,
 				ctx,
 				req: reqLog,
+				identity,
 			});
 			logEvent('worker_error', ctx, 500, message);
 

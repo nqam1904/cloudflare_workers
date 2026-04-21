@@ -1,0 +1,560 @@
+---
+description: Cloudflare Worker - HLS Video Gateway (cloudflare_workers). Part of Nise LMS solution. Verifies video tokens, validates origin/IP, streams HLS manifests and segments from R2 with security controls.
+alwaysApply: false
+---
+
+# cloudflare_workers - HLS Video Gateway & Access Control
+
+Cloudflare Worker that acts as a security gateway for HLS video streaming, running at the CDN edge globally.
+
+## Quick Links
+- **Frontend (nise-fe):** `../nise-fe/` - Requests video tokens
+- **Backend (nise-be):** `../nise-be/` - Signs video tokens
+
+## Purpose
+
+This Worker protects video content stored in Cloudflare R2 by:
+1. Verifying HMAC-signed tokens from nise-be
+2. Validating client origin and IP address
+3. Re-signing segment tokens with IP binding (anti-theft)
+4. Blocking direct downloads and download tools (IDM)
+5. Serving .m3u8 playlists and .ts segments with proper caching
+
+## Technology Stack
+
+- **Platform:** Cloudflare Workers (V8 JavaScript runtime at edge)
+- **Language:** TypeScript 5.5.2 (compiled to JavaScript)
+- **Build Tool:** Wrangler 4.59.2
+- **Testing:** Vitest 3.2.0 + @cloudflare/vitest-pool-workers 0.8.19
+- **Storage:** Cloudflare R2 bucket (S3-compatible object storage)
+
+## Configuration (wrangler.jsonc)
+
+```jsonc
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "worker",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-09-27",
+
+  // Enable Cloudflare Observability (logs visible in dashboard)
+  "observability": {
+    "enabled": true
+  },
+
+  // R2 Bucket Binding - provides R2_BUCKET variable in code
+  "r2_buckets": [
+    {
+      "binding": "R2_BUCKET",
+      "bucket_name": "nisevn"
+    }
+  ]
+}
+```
+
+## Environment Secrets (managed via `wrangler secret put`)
+
+**Video token signing secret** (MUST match nise-be VIDEO_TOKEN_SECRET):
+```bash
+wrangler secret put VIDEO_TOKEN_SECRET
+# Value: same secret as nise-be environment variable
+```
+
+**Allowed origin** (domain where frontend is hosted):
+```bash
+wrangler secret put ALLOWED_ORIGIN
+# Example: https://nise.example.com
+# Or: http://localhost:3001 (for local dev)
+```
+
+**(Optional) Discord webhook** for error notifications:
+```bash
+wrangler secret put WEBHOOK_DISCORD_URL
+# Example: https://discordapp.com/api/webhooks/CHANNEL_ID/TOKEN
+```
+
+## Scripts
+
+```bash
+npm run dev              # Start local development server (wrangler dev)
+npm run start            # Alias for 'dev'
+npm run deploy           # Deploy to Cloudflare (wrangler deploy)
+npm run test             # Run tests (vitest)
+npm run cf-typegen       # Generate Cloudflare types for current env
+```
+
+## Project Structure
+
+```
+cloudflare_workers/
+??? src/
+?   ??? index.ts                  # Single-file Worker (430 lines)
+?                                 # All logic in one file for simplicity
+??? test/
+?   ??? (test files)
+??? wrangler.jsonc                # Wrangler configuration
+??? package.json
+??? tsconfig.json
+??? vitest.config.mts
+```
+
+## Core Logic (src/index.ts)
+
+Single-file Worker handling all HLS video requests with comprehensive security validation.
+
+### Types & Interfaces
+
+```typescript
+interface Env {
+  VIDEO_TOKEN_SECRET: string;      // HMAC signing secret
+  R2_BUCKET: R2Bucket;             // R2 bucket binding
+  ALLOWED_ORIGIN: string;          // Allowed frontend domain
+  WEBHOOK_DISCORD_URL?: string;    // Optional error webhook
+}
+
+type TokenPayload = {
+  vid: string;                     // Video ID (e.g., "video-uuid-123")
+  exp?: number;                    // Unix timestamp in seconds
+  ip?: string;                     // Client IP (for segment validation)
+  [k: string]: unknown;            // Custom fields allowed
+}
+
+type ReqCtx = {
+  path: string;                    // Request path
+  origin: string | null;           // Origin header
+  range: string | null;            // Range header
+}
+
+type VerifyResult =
+  | { ok: true; payload: TokenPayload }
+  | { ok: false; reason: string }
+```
+
+### Request Processing Flow
+
+| Step | URL Match | Validation | Response |
+|------|-----------|-----------|----------|
+| **1. CORS Preflight** | `OPTIONS *` | None | 204 OK + CORS headers |
+| **2. Origin Check** | `*.m3u8` or `*.ts` | Verify `Origin`/`Referer` in whitelist | 403 if not allowed |
+| **3. Manifest (.m3u8)** | `*.m3u8` | `?token=...` required, HMAC verify, fetch from R2 | Re-sign segments, return 200 or 403 |
+| **4. Segment (.ts)** | `*.ts` | `st` query param required, token verify, IP check, fetch mode check | Return 200 or 206 or 403 |
+| **5. Range Support** | `*.ts` + Range header | Parse bytes range | 206 Partial Content + Content-Range |
+| **6. Fallback** | Any other path | None | Serve from R2 as static file, or 404 |
+
+### Security Checks in Detail
+
+#### 1. CORS & Origin Validation
+
+**Function:** `isAllowedOrigin(origin, referer, allowed): boolean`
+
+- Requires either `Origin` or `Referer` header to match `ALLOWED_ORIGIN`
+- For `.m3u8` and `.ts` requests without origin/referer: rejected with 403
+- Other requests can proceed without origin (e.g., static files)
+
+```typescript
+const allowed = 'https://nise.example.com';
+isAllowedOrigin('https://nise.example.com', '', allowed) // true
+isAllowedOrigin(null, 'https://nise.example.com/', allowed) // true
+isAllowedOrigin('https://evil.com', '', allowed) // false
+```
+
+#### 2. Token Verification (HMAC-SHA256)
+
+**Functions:** `sign()`, `verifyToken()`, `safeEqual()`
+
+**Token Format:**
+```
+base64url(json.signature)
+where signature = hex(HMAC-SHA256(json, secret))
+```
+
+**Verification steps:**
+1. Base64url decode token
+2. Split into `json` and `sig` parts (separated by `.`)
+3. Compute HMAC-SHA256 of `json` using `VIDEO_TOKEN_SECRET`
+4. Compare computed signature with provided signature (timing-safe)
+5. Parse JSON payload
+6. Check expiry: `payload.exp > Math.floor(Date.now() / 1000)`
+
+**Timing-safe comparison:** Prevents timing attacks on token validation
+```typescript
+function safeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let result = 0;
+  for (let i = 0; i < a.length; i++) {
+    result |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return result === 0;
+}
+```
+
+#### 3. Video ID Validation
+
+**Path format:** `/course-videos/{vid}/hls/seg_xxx.ts`
+
+**Validation:**
+- Extract video ID from request path
+- Token payload `vid` must match extracted `vid`
+- Prevents: token reuse for different videos
+
+```typescript
+// Path: /course-videos/video-123/hls/seg_001.ts
+// Extracted vid: 'video-123'
+// Token payload.vid: 'video-123' (OK)
+// Token payload.vid: 'video-456' (REJECT - 403)
+```
+
+#### 4. IP Anti-Theft (IDM Prevention)
+
+**For segment requests (.ts):**
+
+1. Get client IP from `cf-connecting-ip` header (set by Cloudflare)
+2. Token payload includes `ip` field (set by nise-be for segment tokens)
+3. Compare current request IP with token IP
+4. Reject if IPs don't match
+
+**Prevents:** Link sharing, IDM download managers, VPN IP switching
+
+```typescript
+// Manifest token (no IP):
+{ vid: 'video-123', exp: ... }
+
+// Segment token (IP-bound):
+{ vid: 'video-123', ip: '203.0.113.45', exp: ... }
+```
+
+#### 5. Fetch Mode Validation (Direct Download Prevention)
+
+**Checks request headers:**
+- `sec-fetch-dest` - must be `empty`, `video`, or `audio` (not `document`)
+- `sec-fetch-mode` - must NOT be `navigate` or `nested-navigate`
+
+**Prevents:** 
+- Opening video in new tab (sec-fetch-mode: navigate)
+- Saving video via right-click (sec-fetch-dest: document)
+- Copy/paste URL to download
+
+**Browser header values:**
+```
+User action -> Headers
+Embedded <video> tag -> sec-fetch-dest: video
+<audio> tag -> sec-fetch-dest: audio
+New tab (Ctrl+click) -> sec-fetch-mode: navigate
+Direct link in address bar -> sec-fetch-mode: navigate
+Right-click save -> sec-fetch-dest: document
+```
+
+### Manifest Response (.m3u8)
+
+**Process:**
+1. Verify token and origin
+2. Fetch playlist from R2: `/path/to/stream.m3u8`
+3. Parse playlist (lines starting without `#`)
+4. For each segment line, append `?st={segmentToken}`
+5. Return playlist with `Cache-Control: no-store`
+
+**Example transformation:**
+```
+Original from R2:
+#EXTM3U
+#EXT-X-VERSION:3
+segment_001.ts
+segment_002.ts
+
+Returned to client:
+#EXTM3U
+#EXT-X-VERSION:3
+segment_001.ts?st=eyJk...
+segment_002.ts?st=eyJk...
+```
+
+**Segment token payload:**
+```typescript
+{
+  vid: 'video-123',
+  ip: '203.0.113.45',  // Client IP
+  exp: Math.floor(Date.now() / 1000) + 4 * 3600  // 4 hours
+}
+```
+
+### Segment Response (.ts)
+
+**Process:**
+1. Verify segment token (includes IP validation)
+2. Extract video ID from path
+3. Validate `vid` matches token `vid`
+4. Check fetch mode headers
+5. Parse Range header if present (for HTTP range requests)
+6. Fetch from R2 with optional range
+7. Return with appropriate headers
+
+**Headers for .ts responses:**
+```
+Content-Type: video/mp2t
+Cache-Control: public, max-age=31536000, immutable
+Accept-Ranges: bytes
+Content-Range: bytes 0-1048575/10485760 (if range request)
+X-Content-Type-Options: nosniff
+```
+
+**Range request handling:**
+```
+Request: Range: bytes=0-1048575
+-> Parse start=0, end=1048575
+-> Calculate length=1048576
+-> Fetch from R2 with offset/length
+-> Response status: 206 Partial Content
+-> Response header: Content-Range: bytes 0-1048575/total_size
+```
+
+### Error Handling
+
+**On rejection or error:**
+
+1. Log JSON event: `{ event, path, origin, range, status, reason }`
+2. Send Discord webhook (if configured and using execCtx.waitUntil)
+3. Return error response with CORS headers
+
+**Discord webhook payload:**
+```json
+{
+  "title": "?? Worker reject",
+  "color": 16711680,
+  "fields": [
+    { "name": "Status", "value": "403" },
+    { "name": "Reason", "value": "origin_not_allowed" },
+    { "name": "Referer", "value": "https://evil.com" },
+    { "name": "Origin", "value": "https://evil.com" },
+    { "name": "Context", "value": "{...}" }
+  ],
+  "footer": { "text": "NISE Worker" }
+}
+```
+
+**Logged events:**
+- `preflight` - OPTIONS request (204)
+- `request_rejected` - Security check failed
+- `manifest_served` - .m3u8 served (200)
+- `seg_served` - .ts served (200 or 206)
+- `r2_served` - Static file from R2 (200)
+- `worker_error` - Unhandled exception (500)
+
+### Utility Functions
+
+**Base64URL encoding/decoding (JWT style):**
+```typescript
+b64uDecode(str: string): string
+b64uEncode(str: string): string
+```
+
+**Cryptographic signing:**
+```typescript
+async sign(body: string, secret: string): Promise<string>
+async verifyToken(token: string, secret: string, execCtx, env): Promise<VerifyResult>
+function safeEqual(a: string, b: string): boolean
+```
+
+**CORS handling:**
+```typescript
+function cors(origin: string | null, referer: string, allowed: string): Headers
+function isAllowedOrigin(origin: string | null, referer: string, allowed: string): boolean
+```
+
+**Discord webhooks:**
+```typescript
+async function notifyDiscordWebhook(webhookUrl: string, payload: WebhookPayload): Promise<void>
+function buildDiscordEmbed(payload: WebhookPayload): object
+function fireErrorWebhook(execCtx, env, opts): void
+```
+
+**Logging:**
+```typescript
+function logEvent(event: string, ctx: ReqCtx, status: number, reason?: string): void
+// Output: JSON line to Workers Logs
+```
+
+**Response helpers:**
+```typescript
+function resp(body, status, origin, referer, allowed, extra?: HeadersInit): Response
+function makeReject(origin, allowed, referer, env, execCtx, req): (ctx, status, reason) => Response
+```
+
+## Logging & Observability
+
+### Workers Logs (Real-time)
+
+Each request logs one JSON line visible in Cloudflare Dashboard:
+
+```json
+{
+  "event": "manifest_served",
+  "path": "/course-videos/vid123/hls/stream.m3u8",
+  "origin": "https://nise.example.com",
+  "range": null,
+  "status": 200
+}
+```
+
+**Access logs:**
+- Cloudflare Dashboard -> Workers -> Real-time Logs
+- Search by worker name: `worker`
+- Filter by status, path, event
+
+### Discord Webhooks
+
+Error notifications sent via Discord embed:
+- Title: Event description (e.g., "?? Worker reject")
+- Color: Red for errors (0xff0000)
+- Fields: status, reason, origin, referer, context
+- Footer: "NISE Worker"
+- Sent asynchronously (doesn't block response)
+
+**Setup:**
+```bash
+wrangler secret put WEBHOOK_DISCORD_URL
+# Paste Discord webhook URL
+```
+
+## Integration with nise-be
+
+**Video Token Signing:**
+
+Backend signs manifest token:
+```typescript
+const token = await sign(
+  JSON.stringify({
+    vid: 'video-uuid-123',
+    exp: Math.floor(Date.now() / 1000) + 15 * 60  // 15 min
+  }),
+  process.env.VIDEO_TOKEN_SECRET
+);
+// Returns: base64url(json.signature)
+```
+
+Worker verifies and re-signs segment tokens:
+```typescript
+const result = await verifyToken(token, env.VIDEO_TOKEN_SECRET, execCtx, env);
+if (result.ok) {
+  const segmentToken = await sign(
+    JSON.stringify({
+      vid: result.payload.vid,
+      ip: clientIp,
+      exp: Math.floor(Date.now() / 1000) + 4 * 3600  // 4 hours
+    }),
+    env.VIDEO_TOKEN_SECRET
+  );
+}
+```
+
+**Critical:** `VIDEO_TOKEN_SECRET` must be identical in both projects.
+
+## Integration with nise-fe
+
+**Frontend flow:**
+
+1. Fetch video token from nise-be: `POST /api/assets/sign-video-token`
+2. Get signed token from backend response
+3. Pass token to hls.js: `https://worker.example.com/.../stream.m3u8?token=...`
+4. hls.js fetches manifest from Worker (via `ALLOWED_ORIGIN`)
+5. Worker returns manifest with signed segment URLs
+6. hls.js fetches segments, each with `st` query param
+7. Worker validates segment token before serving from R2
+
+**CORS Flow:**
+- Frontend browser includes `Origin: https://nise.example.com`
+- Worker checks against `ALLOWED_ORIGIN` env var
+- If match: allow request + set CORS headers
+- If mismatch: reject with 403
+
+## Local Development
+
+```bash
+# Start development server (with hot reload)
+npm run dev
+# Worker runs on: http://localhost:8787
+
+# With local R2 bucket emulation (if configured)
+wrangler dev --local
+```
+
+**Testing locally:**
+```bash
+# Test manifest request
+curl -X GET "http://localhost:8787/course-videos/test-vid/hls/stream.m3u8?token=..." \
+  -H "Origin: http://localhost:3001"
+
+# Test segment with range
+curl -X GET "http://localhost:8787/course-videos/test-vid/hls/seg_001.ts?st=..." \
+  -H "Range: bytes=0-1048575" \
+  -H "Origin: http://localhost:3001"
+```
+
+## Deployment
+
+```bash
+# Deploy to Cloudflare
+npm run deploy
+# Worker publishes to edge globally
+
+# Monitor deployment
+wrangler deployments list
+```
+
+**Production checklist:**
+- [ ] `VIDEO_TOKEN_SECRET` configured in Cloudflare secrets
+- [ ] `ALLOWED_ORIGIN` set to production frontend domain
+- [ ] `WEBHOOK_DISCORD_URL` (optional) for monitoring
+- [ ] R2 bucket `nisevn` created and linked
+- [ ] Rate limiting configured (if needed)
+- [ ] Logs checked in Cloudflare Dashboard
+
+## Testing
+
+```bash
+# Run test suite
+npm run test
+
+# Watch mode
+npm run test --watch
+```
+
+## Related Projects in Workspace
+
+- **nise-fe** (Frontend) - `../nise-fe/`
+  - Requests video tokens from nise-be
+  - Passes tokens to this Worker via hls.js
+  - See: `.cursor/rules/frontend-architecture.mdc`
+
+- **nise-be** (Backend) - `../nise-be/`
+  - Signs manifest tokens (calls `sign()` function logic)
+  - Uses same `VIDEO_TOKEN_SECRET` for token generation
+  - See: `.cursor/rules/backend-architecture.mdc`
+
+## Troubleshooting
+
+### Token Rejection
+
+**Error: "bad_signature"**
+- Verify `VIDEO_TOKEN_SECRET` matches between nise-be and Worker
+- Check token wasn't tampered with
+- Confirm token format: `base64url(json.sig)`
+
+**Error: "token_expired"**
+- Check server time sync between nise-be and Worker
+- Verify token expiry values (15 min for manifest, 4 hours for segments)
+
+### CORS Failures
+
+**Error: "origin_not_allowed"**
+- Check `ALLOWED_ORIGIN` env var matches frontend domain exactly
+- Verify frontend sends `Origin` header (browsers do automatically)
+- Test: `curl -H "Origin: ..." http://worker-url`
+
+### Video Not Playing
+
+**Steps:**
+1. Check browser console for network errors
+2. Open Worker logs: Cloudflare Dashboard -> Workers -> Real-time Logs
+3. Verify token is being passed: `?token=...` in manifest URL
+4. Check Discord webhook for rejection details
+5. Ensure R2 bucket contains HLS files at expected path

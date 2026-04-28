@@ -1,7 +1,23 @@
 const DISCORD_FIELD_VALUE_LIMIT = 1000;
+const CLOUDFLARE_WEB_BOT_AUTH_AGENT = 'https://web-bot-auth-directory.radar.cloudflare.com/';
 
 function truncateWebhookFieldValue(value: string): string {
 	return value.slice(0, DISCORD_FIELD_VALUE_LIMIT);
+}
+
+function getHeaderValue(headers: Headers | Record<string, string> | undefined, name: string): string | null {
+	if (!headers) return null;
+	if (typeof (headers as Headers).get === 'function') return (headers as Headers).get(name);
+	return (headers as Record<string, string>)[name.toLowerCase()] ?? (headers as Record<string, string>)[name] ?? null;
+}
+
+function normalizeSignatureAgent(value: string | null | undefined): string {
+	return (value ?? '').trim().replace(/^"+|"+$/g, '');
+}
+
+function isCloudflareWebBotAuthRequest(req: { headers?: Headers | Record<string, string> } | undefined): boolean {
+	const signatureAgent = normalizeSignatureAgent(getHeaderValue(req?.headers, 'signature-agent'));
+	return signatureAgent === CLOUDFLARE_WEB_BOT_AUTH_AGENT;
 }
 
 export interface Env {
@@ -236,28 +252,31 @@ function makeReject(
 		const userAgent = req?.headers?.['user-agent'] ?? undefined;
 		const clientIp = req?.headers?.['cf-connecting-ip'] ?? undefined;
 		const country = req?.headers?.['cf-ipcountry'] ?? undefined;
+		const shouldNotify = !isCloudflareWebBotAuthRequest(req);
 
-		fireErrorWebhook(execCtx, env, {
-			status,
-			reason,
-			referer,
-			origin,
-			ctx,
-			req,
-			identity,
-		});
+		if (shouldNotify) {
+			fireErrorWebhook(execCtx, env, {
+				status,
+				reason,
+				referer,
+				origin,
+				ctx,
+				req,
+				identity,
+			});
 
-		fireIngestApi(execCtx, env, {
-			event: 'request_rejected',
-			status,
-			reason,
-			ctx,
-			referer,
-			userAgent,
-			clientIp,
-			country,
-			identity,
-		});
+			fireIngestApi(execCtx, env, {
+				event: 'request_rejected',
+				status,
+				reason,
+				ctx,
+				referer,
+				userAgent,
+				clientIp,
+				country,
+				identity,
+			});
+		}
 
 		logEvent('request_rejected', ctx, status, reason);
 		const h = cors(origin, referer, allowed);
@@ -560,28 +579,31 @@ export default {
 			});
 		} catch (error) {
 			const message = error instanceof Error ? `${error.name}: ${error.message}` : 'Unknown error';
+			const shouldNotify = !isCloudflareWebBotAuthRequest(req);
 
-			fireErrorWebhook(execCtx, env, {
-				status: 500,
-				reason: message,
-				referer,
-				origin,
-				ctx,
-				req: reqLog,
-				identity,
-			});
+			if (shouldNotify) {
+				fireErrorWebhook(execCtx, env, {
+					status: 500,
+					reason: message,
+					referer,
+					origin,
+					ctx,
+					req: reqLog,
+					identity,
+				});
 
-			fireIngestApi(execCtx, env, {
-				event: 'worker_error',
-				status: 500,
-				reason: message,
-				ctx,
-				referer,
-				userAgent: req.headers.get('user-agent') ?? undefined,
-				clientIp: req.headers.get('cf-connecting-ip') ?? undefined,
-				country: req.headers.get('cf-ipcountry') ?? undefined,
-				identity,
-			});
+				fireIngestApi(execCtx, env, {
+					event: 'worker_error',
+					status: 500,
+					reason: message,
+					ctx,
+					referer,
+					userAgent: req.headers.get('user-agent') ?? undefined,
+					clientIp: req.headers.get('cf-connecting-ip') ?? undefined,
+					country: req.headers.get('cf-ipcountry') ?? undefined,
+					identity,
+				});
+			}
 
 			logEvent('worker_error', ctx, 500, message);
 

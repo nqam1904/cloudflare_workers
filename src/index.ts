@@ -241,8 +241,11 @@ function resolveIngestUrl(env: Env): string | null {
 	if (!env.NISE_BE_API_URL) {
 		return null;
 	}
-	const apiUrl = env.NISE_BE_API_URL.trim().replace(/\/+$/, '');
-	return `${apiUrl}/worker-monitor/ingest`;
+	const baseUrl = env.NISE_BE_API_URL.trim().replace(/\/+$/, '');
+	const hasApiPrefix = baseUrl.endsWith('/api');
+	return hasApiPrefix
+		? `${baseUrl}/worker-monitor/ingest`
+		: `${baseUrl}/api/worker-monitor/ingest`;
 }
 
 function fireIngestApi(

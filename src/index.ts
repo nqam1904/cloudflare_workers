@@ -291,12 +291,18 @@ function fireIngestApi(
 		timestamp: new Date().toISOString(),
 	};
 
+	const allowedOrigin = normalizeOrigin(env.ALLOWED_ORIGIN?.split(',')[0] ?? '');
+
 	execCtx.waitUntil(
 		fetch(ingestUrl, {
 			method: 'POST',
 			headers: {
 				'Content-Type': 'application/json',
-				'User-Agent': 'NISE-Cloudflare-Worker/1.0',
+				Accept: 'application/json',
+				Origin: allowedOrigin || 'https://loveblender.online',
+				Referer: `${allowedOrigin || 'https://loveblender.online'}/`,
+				'User-Agent':
+					'Mozilla/5.0 (compatible; NISE-Cloudflare-Worker/1.0; +https://loveblender.online)',
 				'X-Worker-Log-Source': 'cloudflare-workers',
 			},
 			body: JSON.stringify(body),

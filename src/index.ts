@@ -75,8 +75,10 @@ function normalizeOrigin(origin: string): string {
 	return origin.trim().replace(/\/+$/, '');
 }
 
-function getAllowedOrigins(allowed: string): string[] {
-	return [...allowed.split(','), ...ADDITIONAL_ALLOWED_ORIGINS].map(normalizeOrigin).filter(Boolean);
+function getAllowedOrigins(envAllowedOrigin: string): string[] {
+	return Array.from(
+		new Set([...envAllowedOrigin.split(','), ...ADDITIONAL_ALLOWED_ORIGINS].map(normalizeOrigin).filter(Boolean)),
+	);
 }
 
 function isAllowedOrigin(origin: string | null, referer: string, allowed: string): boolean {
@@ -94,9 +96,10 @@ function isAllowedOrigin(origin: string | null, referer: string, allowed: string
 
 function cors(origin: string | null, referer: string, allowed: string): Headers {
 	const h = new Headers();
+	const allowedOrigins = getAllowedOrigins(allowed);
 
-	if (isAllowedOrigin(origin, referer, allowed)) {
-		h.set('Access-Control-Allow-Origin', origin || allowed);
+	if (isAllowedOrigin(origin, referer, allowed) && allowedOrigins.length > 0) {
+		h.set('Access-Control-Allow-Origin', origin ? normalizeOrigin(origin) : allowedOrigins[0]);
 		h.set('Access-Control-Allow-Credentials', 'true');
 	}
 

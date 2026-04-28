@@ -67,6 +67,13 @@ wrangler secret put ALLOWED_ORIGIN
 # Or: http://localhost:3001 (for local dev)
 ```
 
+**(Optional) nise-be API URL** for error log ingest:
+```bash
+wrangler secret put NISE_BE_API_URL
+# Example: https://api.nise.example.com (no trailing slash)
+# Worker POSTs error logs to: ${NISE_BE_API_URL}/worker-monitor/ingest
+```
+
 **(Optional) Discord webhook** for error notifications:
 ```bash
 wrangler secret put WEBHOOK_DISCORD_URL
@@ -87,15 +94,15 @@ npm run cf-typegen       # Generate Cloudflare types for current env
 
 ```
 cloudflare_workers/
-??? src/
-?   ??? index.ts                  # Single-file Worker (430 lines)
-?                                 # All logic in one file for simplicity
-??? test/
-?   ??? (test files)
-??? wrangler.jsonc                # Wrangler configuration
-??? package.json
-??? tsconfig.json
-??? vitest.config.mts
+|-- src/
+|   |-- index.ts                  # Single-file Worker (430 lines)
+|   |                             # All logic in one file for simplicity
+|-- test/
+|   `-- (test files)
+|-- wrangler.jsonc                # Wrangler configuration
+|-- package.json
+|-- tsconfig.json
+`-- vitest.config.mts
 ```
 
 ## Core Logic (src/index.ts)
@@ -109,7 +116,8 @@ interface Env {
   VIDEO_TOKEN_SECRET: string;      // HMAC signing secret
   R2_BUCKET: R2Bucket;             // R2 bucket binding
   ALLOWED_ORIGIN: string;          // Allowed frontend domain
-  WEBHOOK_DISCORD_URL?: string;    // Optional error webhook
+  WEBHOOK_DISCORD_URL?: string;    // Optional Discord error webhook
+  NISE_BE_API_URL?: string;        // Optional nise-be URL for error log ingest
 }
 
 type TokenPayload = {
@@ -309,35 +317,52 @@ Request: Range: bytes=0-1048575
 
 ### Error Handling
 
-**On rejection or error:**
+**On rejection or error, three channels fire in parallel:**
 
-1. Log JSON event: `{ event, path, origin, range, status, reason }`
-2. Send Discord webhook (if configured and using execCtx.waitUntil)
-3. Return error response with CORS headers
+1. **Console log** — JSON event: `{ event, path, origin, range, status, reason }` (visible in Cloudflare Dashboard → Workers → Real-time Logs)
+2. **Discord webhook** — rich embed alert via `fireErrorWebhook` (if `WEBHOOK_DISCORD_URL` set)
+3. **nise-be ingest API** — POST to `${NISE_BE_API_URL}/worker-monitor/ingest` via `fireIngestApi` (if `NISE_BE_API_URL` set); persists error to DB for staff dashboard & automated email notifications
 
-**Discord webhook payload:**
-```json
+All three fire via `execCtx.waitUntil()` and do not block the response.
+
+**`makeReject` — central rejection handler:**
+```
+reject(ctx, status, reason)
+  → fireErrorWebhook(...)     // Discord notification
+  → fireIngestApi(...)         // nise-be DB ingest
+  → logEvent(...)              // console.log JSON
+  → return Response(reason, { status })
+```
+
+**`fireIngestApi` request body:**
+```typescript
 {
-  "title": "?? Worker reject",
-  "color": 16711680,
-  "fields": [
-    { "name": "Status", "value": "403" },
-    { "name": "Reason", "value": "origin_not_allowed" },
-    { "name": "Referer", "value": "https://evil.com" },
-    { "name": "Origin", "value": "https://evil.com" },
-    { "name": "Context", "value": "{...}" }
-  ],
-  "footer": { "text": "NISE Worker" }
+  event: 'request_rejected' | 'worker_error',
+  status: number,
+  reason: string,
+  path: string,
+  origin?: string,
+  referer?: string,
+  userAgent?: string,      // from cf-connecting-ip header
+  clientIp?: string,       // from cf-connecting-ip header
+  country?: string,        // from cf-ipcountry header
+  range?: string,
+  videoId?: string,        // extracted from path
+  userId?: string,         // from token payload (best-effort decode)
+  email?: string,          // from token payload (best-effort decode)
+  timestamp: string,       // ISO 8601
 }
 ```
 
-**Logged events:**
-- `preflight` - OPTIONS request (204)
-- `request_rejected` - Security check failed
-- `manifest_served` - .m3u8 served (200)
-- `seg_served` - .ts served (200 or 206)
-- `r2_served` - Static file from R2 (200)
-- `worker_error` - Unhandled exception (500)
+**`logTokenVerifyError` — token verification diagnostics:**
+Token verification failures (malformed_token, bad_signature, token_expired, decode_error) are logged to `console.error` with `[verifyToken]` prefix for Cloudflare Dashboard inspection. The caller then fires `reject()` which handles Discord + ingest API.
+
+**Logged events (console.log):**
+- `preflight` — OPTIONS request (204)
+- `request_rejected` — security check failed (403/404)
+- `manifest_served` — .m3u8 served (200)
+- `r2_served` — static file / .ts served (200 or 206)
+- `worker_error` — unhandled exception (500)
 
 ### Utility Functions
 
@@ -350,7 +375,7 @@ b64uEncode(str: string): string
 **Cryptographic signing:**
 ```typescript
 async sign(body: string, secret: string): Promise<string>
-async verifyToken(token: string, secret: string, execCtx, env): Promise<VerifyResult>
+async verifyToken(token: string, secret: string): Promise<VerifyResult>
 function safeEqual(a: string, b: string): boolean
 ```
 
@@ -360,26 +385,47 @@ function cors(origin: string | null, referer: string, allowed: string): Headers
 function isAllowedOrigin(origin: string | null, referer: string, allowed: string): boolean
 ```
 
+**User identity extraction (best-effort, no signature check):**
+```typescript
+function tryDecodeTokenPayload(token: string | null): Partial<TokenPayload> | null
+function extractUserIdentity(payload): UserIdentity    // { userId?, email? }
+function extractUserIdentityFromUrl(url: URL): UserIdentity
+```
+
 **Discord webhooks:**
 ```typescript
-async function notifyDiscordWebhook(webhookUrl: string, payload: WebhookPayload): Promise<void>
+function notifyDiscordWebhook(webhookUrl: string, payload: WebhookPayload): Promise<void>
 function buildDiscordEmbed(payload: WebhookPayload): object
 function fireErrorWebhook(execCtx, env, opts): void
+```
+
+**nise-be ingest:**
+```typescript
+function fireIngestApi(execCtx, env, opts): void
+function extractVideoIdFromPath(path: string): string | null
 ```
 
 **Logging:**
 ```typescript
 function logEvent(event: string, ctx: ReqCtx, status: number, reason?: string): void
-// Output: JSON line to Workers Logs
+function logTokenVerifyError(reason: string, detail: Record<string, unknown>): void
 ```
 
 **Response helpers:**
 ```typescript
 function resp(body, status, origin, referer, allowed, extra?: HeadersInit): Response
-function makeReject(origin, allowed, referer, env, execCtx, req): (ctx, status, reason) => Response
+function makeReject(origin, allowed, referer, env, execCtx, req, identity): (ctx, status, reason) => Response
 ```
 
 ## Logging & Observability
+
+### Three Monitoring Channels
+
+| Channel | Destination | Trigger | Config Required |
+|---------|------------|---------|-----------------|
+| **Console log** | Cloudflare Dashboard → Real-time Logs | Every request | None (always on) |
+| **Discord webhook** | Discord channel embed | Rejections + 500s | `WEBHOOK_DISCORD_URL` secret |
+| **nise-be ingest** | MySQL `worker_error_logs` table | Rejections + 500s | `NISE_BE_API_URL` secret |
 
 ### Workers Logs (Real-time)
 
@@ -395,17 +441,28 @@ Each request logs one JSON line visible in Cloudflare Dashboard:
 }
 ```
 
+Token verification errors additionally log:
+```
+[verifyToken] bad_signature {"expected":"abc...","sig":"xyz..."}
+```
+
+Ingest API failures log:
+```
+[fireIngestApi] 400 Bad Request: {"statusCode":400,"message":["..."]}
+[fireIngestApi] fetch failed: TypeError: ...
+```
+
 **Access logs:**
-- Cloudflare Dashboard -> Workers -> Real-time Logs
+- Cloudflare Dashboard → Workers → Real-time Logs
 - Search by worker name: `worker`
 - Filter by status, path, event
 
 ### Discord Webhooks
 
 Error notifications sent via Discord embed:
-- Title: Event description (e.g., "?? Worker reject")
+- Title: "Worker reject"
 - Color: Red for errors (0xff0000)
-- Fields: status, reason, origin, referer, context
+- Fields: user ID, email, status, reason, referer, origin, context, request
 - Footer: "NISE Worker"
 - Sent asynchronously (doesn't block response)
 
@@ -415,15 +472,29 @@ wrangler secret put WEBHOOK_DISCORD_URL
 # Paste Discord webhook URL
 ```
 
+### nise-be Error Log Ingest
+
+Worker POSTs error logs to nise-be `POST /worker-monitor/ingest` (no auth required).
+Logs are persisted to `worker_error_logs` MySQL table for the staff Worker Monitor dashboard.
+A cron job (every 2 hours) groups unsent logs by email and sends notification emails for `origin_not_allowed`, `missing_origin`, and `direct_download_blocked` reasons.
+
+**Setup:**
+```bash
+wrangler secret put NISE_BE_API_URL
+# Example: https://api.nise.example.com
+```
+
 ## Integration with nise-be
 
-**Video Token Signing:**
+### Video Token Signing
 
 Backend signs manifest token:
 ```typescript
 const token = await sign(
   JSON.stringify({
     vid: 'video-uuid-123',
+    userId: 'user-uuid',
+    email: 'user@example.com',
     exp: Math.floor(Date.now() / 1000) + 15 * 60  // 15 min
   }),
   process.env.VIDEO_TOKEN_SECRET
@@ -431,22 +502,39 @@ const token = await sign(
 // Returns: base64url(json.signature)
 ```
 
-Worker verifies and re-signs segment tokens:
+Worker verifies and re-signs segment tokens (forwarding user identity):
 ```typescript
-const result = await verifyToken(token, env.VIDEO_TOKEN_SECRET, execCtx, env);
+const result = await verifyToken(token, env.VIDEO_TOKEN_SECRET);
 if (result.ok) {
-  const segmentToken = await sign(
-    JSON.stringify({
-      vid: result.payload.vid,
-      ip: clientIp,
-      exp: Math.floor(Date.now() / 1000) + 4 * 3600  // 4 hours
-    }),
-    env.VIDEO_TOKEN_SECRET
-  );
+  const segPayload = {
+    vid: result.payload.vid,
+    ip: clientIp,
+    exp: Math.floor(Date.now() / 1000) + 4 * 3600,  // 4 hours
+    userId: result.payload.userId,   // forwarded from manifest token
+    email: result.payload.email,     // forwarded from manifest token
+  };
+  const segmentToken = await sign(JSON.stringify(segPayload), env.VIDEO_TOKEN_SECRET);
 }
 ```
 
 **Critical:** `VIDEO_TOKEN_SECRET` must be identical in both projects.
+
+### Worker Monitor Ingest API
+
+Worker sends error logs to nise-be for persistence and email notifications:
+
+```
+Worker reject/error
+  → POST ${NISE_BE_API_URL}/worker-monitor/ingest
+  → nise-be validates DTO & saves to worker_error_logs table
+  → Cron job (every 2h) groups by email & sends notification mails
+  → Staff views logs on /staff/worker-monitor dashboard
+```
+
+**Environment variable:**
+- `NISE_BE_API_URL` must be set as a Cloudflare secret
+- No auth required (the endpoint is public, protected by DTO validation only)
+- Errors are logged to console if the API call fails (check Cloudflare logs)
 
 ## Integration with nise-fe
 
@@ -501,9 +589,10 @@ wrangler deployments list
 ```
 
 **Production checklist:**
-- [ ] `VIDEO_TOKEN_SECRET` configured in Cloudflare secrets
+- [ ] `VIDEO_TOKEN_SECRET` configured in Cloudflare secrets (must match nise-be)
 - [ ] `ALLOWED_ORIGIN` set to production frontend domain
-- [ ] `WEBHOOK_DISCORD_URL` (optional) for monitoring
+- [ ] `NISE_BE_API_URL` set to production backend URL (for error log ingest)
+- [ ] `WEBHOOK_DISCORD_URL` (optional) for Discord error notifications
 - [ ] R2 bucket `nisevn` created and linked
 - [ ] Rate limiting configured (if needed)
 - [ ] Logs checked in Cloudflare Dashboard

@@ -26,8 +26,6 @@ export interface Env {
 	R2_BUCKET: R2Bucket;
 	ALLOWED_ORIGIN: string;
 	WEBHOOK_DISCORD_URL?: string;
-	NISE_BE_API_URL?: string;
-	NISE_BE_INGEST_URL?: string;
 }
 
 /* ===================== TYPES ===================== */
@@ -188,35 +186,6 @@ function fireErrorWebhook(
 	execCtx.waitUntil(notifyDiscordWebhook(webhookUrl, payload));
 }
 
-function fireIngestWarningWebhook(
-	execCtx: ExecutionContext,
-	env: Env,
-	opts: {
-		status: string;
-		url?: string;
-		error?: string;
-		ctx: ReqCtx;
-		reason: string;
-	},
-): void {
-	const webhookUrl = env.WEBHOOK_DISCORD_URL;
-	if (!webhookUrl) return;
-	execCtx.waitUntil(
-		notifyDiscordWebhook(webhookUrl, {
-			title: '⚠️ Worker ingest failed',
-			color: 0xf59e0b,
-			fields: [
-				{ name: 'Status', value: opts.status, inline: false },
-				{ name: 'URL', value: opts.url || '—', inline: false },
-				{ name: 'Reason', value: opts.reason, inline: false },
-				{ name: 'Error', value: opts.error || '—', inline: false },
-				{ name: 'Context', value: JSON.stringify(opts.ctx), inline: false },
-			],
-			footerText: 'NISE Worker',
-		}),
-	);
-}
-
 /**
  * Removed: fireErrorVerifyTokenWebhook was causing duplicate Discord
  * notifications — the caller (reject → fireErrorWebhook) already sends
@@ -225,114 +194,6 @@ function fireIngestWarningWebhook(
  */
 function logTokenVerifyError(reason: string, detail: Record<string, unknown>): void {
 	console.error(`[verifyToken] ${reason}`, JSON.stringify(detail));
-}
-
-/* ===================== NISE-BE INGEST API ===================== */
-
-function extractVideoIdFromPath(path: string): string | null {
-	const parts = path.split('/').filter(Boolean);
-	return parts.length >= 2 && parts[0] === 'course-videos' ? parts[1] : null;
-}
-
-function resolveIngestUrl(env: Env): string | null {
-	if (env.NISE_BE_INGEST_URL) {
-		return env.NISE_BE_INGEST_URL.trim();
-	}
-	if (!env.NISE_BE_API_URL) {
-		return null;
-	}
-	const baseUrl = env.NISE_BE_API_URL.trim().replace(/\/+$/, '');
-	const hasApiPrefix = baseUrl.endsWith('/api');
-	return hasApiPrefix
-		? `${baseUrl}/worker-monitor/ingest`
-		: `${baseUrl}/api/worker-monitor/ingest`;
-}
-
-function fireIngestApi(
-	execCtx: ExecutionContext,
-	env: Env,
-	opts: {
-		event: 'request_rejected' | 'token_verify_failed' | 'worker_error';
-		status: number;
-		reason: string;
-		ctx: ReqCtx;
-		referer: string;
-		userAgent?: string;
-		clientIp?: string;
-		country?: string;
-		identity?: UserIdentity;
-	},
-): void {
-	const ingestUrl = resolveIngestUrl(env);
-	if (!ingestUrl) {
-		console.error('[fireIngestApi] missing NISE_BE_API_URL or NISE_BE_INGEST_URL');
-		fireIngestWarningWebhook(execCtx, env, {
-			status: 'missing_config',
-			ctx: opts.ctx,
-			reason: opts.reason,
-		});
-		return;
-	}
-
-	const body = {
-		event: opts.event,
-		status: opts.status,
-		reason: opts.reason,
-		path: opts.ctx.path,
-		origin: opts.ctx.origin ?? undefined,
-		referer: opts.referer || undefined,
-		userAgent: opts.userAgent,
-		clientIp: opts.clientIp,
-		country: opts.country,
-		range: opts.ctx.range ?? undefined,
-		videoId: extractVideoIdFromPath(opts.ctx.path) ?? undefined,
-		userId: opts.identity?.userId,
-		email: opts.identity?.email,
-		timestamp: new Date().toISOString(),
-	};
-
-	const allowedOrigin = normalizeOrigin(env.ALLOWED_ORIGIN?.split(',')[0] ?? '');
-
-	execCtx.waitUntil(
-		fetch(ingestUrl, {
-			method: 'POST',
-			headers: {
-				'Content-Type': 'application/json',
-				Accept: 'application/json',
-				Origin: allowedOrigin || 'https://loveblender.online',
-				Referer: `${allowedOrigin || 'https://loveblender.online'}/`,
-				'User-Agent':
-					'Mozilla/5.0 (compatible; NISE-Cloudflare-Worker/1.0; +https://loveblender.online)',
-				'X-Worker-Log-Source': 'cloudflare-workers',
-			},
-			body: JSON.stringify(body),
-		})
-			.then(async (res) => {
-				if (!res.ok) {
-					const text = await res.text().catch(() => '');
-					const error = `${res.status} ${res.statusText}: ${text}`;
-					console.error(`[fireIngestApi] ${error}`);
-					fireIngestWarningWebhook(execCtx, env, {
-						status: 'http_error',
-						url: ingestUrl,
-						error,
-						ctx: opts.ctx,
-						reason: opts.reason,
-					});
-				}
-			})
-			.catch((err) => {
-				const error = err instanceof Error ? err.message : String(err);
-				console.error(`[fireIngestApi] fetch failed:`, err);
-				fireIngestWarningWebhook(execCtx, env, {
-					status: 'fetch_failed',
-					url: ingestUrl,
-					error,
-					ctx: opts.ctx,
-					reason: opts.reason,
-				});
-			}),
-	);
 }
 
 function makeReject(
@@ -345,9 +206,6 @@ function makeReject(
 	identity: UserIdentity,
 ) {
 	return (ctx: ReqCtx, status: number, reason: string): Response => {
-		const userAgent = req?.headers?.['user-agent'] ?? undefined;
-		const clientIp = req?.headers?.['cf-connecting-ip'] ?? undefined;
-		const country = req?.headers?.['cf-ipcountry'] ?? undefined;
 		const shouldNotify = !isCloudflareWebBotAuthRequest(req);
 
 		if (shouldNotify) {
@@ -358,18 +216,6 @@ function makeReject(
 				origin,
 				ctx,
 				req,
-				identity,
-			});
-
-			fireIngestApi(execCtx, env, {
-				event: 'request_rejected',
-				status,
-				reason,
-				ctx,
-				referer,
-				userAgent,
-				clientIp,
-				country,
 				identity,
 			});
 		}
@@ -685,18 +531,6 @@ export default {
 					origin,
 					ctx,
 					req: reqLog,
-					identity,
-				});
-
-				fireIngestApi(execCtx, env, {
-					event: 'worker_error',
-					status: 500,
-					reason: message,
-					ctx,
-					referer,
-					userAgent: req.headers.get('user-agent') ?? undefined,
-					clientIp: req.headers.get('cf-connecting-ip') ?? undefined,
-					country: req.headers.get('cf-ipcountry') ?? undefined,
 					identity,
 				});
 			}

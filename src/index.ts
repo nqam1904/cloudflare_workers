@@ -26,6 +26,7 @@ export interface Env {
 	ALLOWED_ORIGIN: string;
 	WEBHOOK_DISCORD_URL?: string;
 	NISE_BE_API_URL?: string;
+	NISE_BE_INGEST_URL?: string;
 }
 
 /* ===================== TYPES ===================== */
@@ -169,6 +170,35 @@ function fireErrorWebhook(
 	execCtx.waitUntil(notifyDiscordWebhook(webhookUrl, payload));
 }
 
+function fireIngestWarningWebhook(
+	execCtx: ExecutionContext,
+	env: Env,
+	opts: {
+		status: string;
+		url?: string;
+		error?: string;
+		ctx: ReqCtx;
+		reason: string;
+	},
+): void {
+	const webhookUrl = env.WEBHOOK_DISCORD_URL;
+	if (!webhookUrl) return;
+	execCtx.waitUntil(
+		notifyDiscordWebhook(webhookUrl, {
+			title: '⚠️ Worker ingest failed',
+			color: 0xf59e0b,
+			fields: [
+				{ name: 'Status', value: opts.status, inline: false },
+				{ name: 'URL', value: opts.url || '—', inline: false },
+				{ name: 'Reason', value: opts.reason, inline: false },
+				{ name: 'Error', value: opts.error || '—', inline: false },
+				{ name: 'Context', value: JSON.stringify(opts.ctx), inline: false },
+			],
+			footerText: 'NISE Worker',
+		}),
+	);
+}
+
 /**
  * Removed: fireErrorVerifyTokenWebhook was causing duplicate Discord
  * notifications — the caller (reject → fireErrorWebhook) already sends
@@ -186,6 +216,16 @@ function extractVideoIdFromPath(path: string): string | null {
 	return parts.length >= 2 && parts[0] === 'course-videos' ? parts[1] : null;
 }
 
+function resolveIngestUrl(env: Env): string | null {
+	if (env.NISE_BE_INGEST_URL) {
+		return env.NISE_BE_INGEST_URL.trim();
+	}
+	if (!env.NISE_BE_API_URL) {
+		return null;
+	}
+	return `${env.NISE_BE_API_URL.trim().replace(/\/+$/, '')}/worker-monitor/ingest`;
+}
+
 function fireIngestApi(
 	execCtx: ExecutionContext,
 	env: Env,
@@ -201,8 +241,16 @@ function fireIngestApi(
 		identity?: UserIdentity;
 	},
 ): void {
-	const apiUrl = env.NISE_BE_API_URL;
-	if (!apiUrl) return;
+	const ingestUrl = resolveIngestUrl(env);
+	if (!ingestUrl) {
+		console.error('[fireIngestApi] missing NISE_BE_API_URL or NISE_BE_INGEST_URL');
+		fireIngestWarningWebhook(execCtx, env, {
+			status: 'missing_config',
+			ctx: opts.ctx,
+			reason: opts.reason,
+		});
+		return;
+	}
 
 	const body = {
 		event: opts.event,
@@ -222,7 +270,7 @@ function fireIngestApi(
 	};
 
 	execCtx.waitUntil(
-		fetch(`${apiUrl}/worker-monitor/ingest`, {
+		fetch(ingestUrl, {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
 			body: JSON.stringify(body),
@@ -230,11 +278,27 @@ function fireIngestApi(
 			.then(async (res) => {
 				if (!res.ok) {
 					const text = await res.text().catch(() => '');
-					console.error(`[fireIngestApi] ${res.status} ${res.statusText}: ${text}`);
+					const error = `${res.status} ${res.statusText}: ${text}`;
+					console.error(`[fireIngestApi] ${error}`);
+					fireIngestWarningWebhook(execCtx, env, {
+						status: 'http_error',
+						url: ingestUrl,
+						error,
+						ctx: opts.ctx,
+						reason: opts.reason,
+					});
 				}
 			})
 			.catch((err) => {
+				const error = err instanceof Error ? err.message : String(err);
 				console.error(`[fireIngestApi] fetch failed:`, err);
+				fireIngestWarningWebhook(execCtx, env, {
+					status: 'fetch_failed',
+					url: ingestUrl,
+					error,
+					ctx: opts.ctx,
+					reason: opts.reason,
+				});
 			}),
 	);
 }

@@ -9,6 +9,7 @@ export interface Env {
 	R2_BUCKET: R2Bucket;
 	ALLOWED_ORIGIN: string;
 	WEBHOOK_DISCORD_URL?: string;
+	NISE_BE_API_URL?: string;
 }
 
 /* ===================== TYPES ===================== */
@@ -152,23 +153,74 @@ function fireErrorWebhook(
 	execCtx.waitUntil(notifyDiscordWebhook(webhookUrl, payload));
 }
 
-function fireErrorVerifyTokenWebhook(execCtx: any, token: any, secret: any, env: any, message: any, payloadVerifyToken: any): void {
-	const webhookUrl = env.WEBHOOK_DISCORD_URL;
-	if (!webhookUrl) return;
-	const identity = extractUserIdentity(tryDecodeTokenPayload(typeof token === 'string' ? token : undefined));
-	const payload: WebhookPayload = {
-		title: `🚨 ${message}`,
-		color: 0xff0000,
-		fields: [
-			...buildUserIdentityFields(identity),
-			{ name: 'Token', value: token || '—', inline: false },
-			{ name: 'Secret', value: secret || '—', inline: false },
-			{ name: 'Message', value: message || '—', inline: false },
-			{ name: 'payloadVerifyToken', value: JSON.stringify(payloadVerifyToken), inline: false },
-		],
-		footerText: 'NISE Worker',
+/**
+ * Removed: fireErrorVerifyTokenWebhook was causing duplicate Discord
+ * notifications — the caller (reject → fireErrorWebhook) already sends
+ * a Discord alert with full request context.  Token verification details
+ * are now logged via console.error for Cloudflare dashboard inspection.
+ */
+function logTokenVerifyError(reason: string, detail: Record<string, unknown>): void {
+	console.error(`[verifyToken] ${reason}`, JSON.stringify(detail));
+}
+
+/* ===================== NISE-BE INGEST API ===================== */
+
+function extractVideoIdFromPath(path: string): string | null {
+	const parts = path.split('/').filter(Boolean);
+	return parts.length >= 2 && parts[0] === 'course-videos' ? parts[1] : null;
+}
+
+function fireIngestApi(
+	execCtx: ExecutionContext,
+	env: Env,
+	opts: {
+		event: 'request_rejected' | 'token_verify_failed' | 'worker_error';
+		status: number;
+		reason: string;
+		ctx: ReqCtx;
+		referer: string;
+		userAgent?: string;
+		clientIp?: string;
+		country?: string;
+		identity?: UserIdentity;
+	},
+): void {
+	const apiUrl = env.NISE_BE_API_URL;
+	if (!apiUrl) return;
+
+	const body = {
+		event: opts.event,
+		status: opts.status,
+		reason: opts.reason,
+		path: opts.ctx.path,
+		origin: opts.ctx.origin ?? undefined,
+		referer: opts.referer || undefined,
+		userAgent: opts.userAgent,
+		clientIp: opts.clientIp,
+		country: opts.country,
+		range: opts.ctx.range ?? undefined,
+		videoId: extractVideoIdFromPath(opts.ctx.path) ?? undefined,
+		userId: opts.identity?.userId,
+		email: opts.identity?.email,
+		timestamp: new Date().toISOString(),
 	};
-	execCtx.waitUntil(notifyDiscordWebhook(webhookUrl, payload));
+
+	execCtx.waitUntil(
+		fetch(`${apiUrl}/worker-monitor/ingest`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify(body),
+		})
+			.then(async (res) => {
+				if (!res.ok) {
+					const text = await res.text().catch(() => '');
+					console.error(`[fireIngestApi] ${res.status} ${res.statusText}: ${text}`);
+				}
+			})
+			.catch((err) => {
+				console.error(`[fireIngestApi] fetch failed:`, err);
+			}),
+	);
 }
 
 function makeReject(
@@ -181,6 +233,10 @@ function makeReject(
 	identity: UserIdentity,
 ) {
 	return (ctx: ReqCtx, status: number, reason: string): Response => {
+		const userAgent = req?.headers?.['user-agent'] ?? undefined;
+		const clientIp = req?.headers?.['cf-connecting-ip'] ?? undefined;
+		const country = req?.headers?.['cf-ipcountry'] ?? undefined;
+
 		fireErrorWebhook(execCtx, env, {
 			status,
 			reason,
@@ -190,6 +246,19 @@ function makeReject(
 			req,
 			identity,
 		});
+
+		fireIngestApi(execCtx, env, {
+			event: 'request_rejected',
+			status,
+			reason,
+			ctx,
+			referer,
+			userAgent,
+			clientIp,
+			country,
+			identity,
+		});
+
 		logEvent('request_rejected', ctx, status, reason);
 		const h = cors(origin, referer, allowed);
 		h.set('Content-Type', 'text/plain');
@@ -271,7 +340,7 @@ async function sign(body: string, secret: string): Promise<string> {
 	return b64uEncode(`${body}.${sig}`);
 }
 
-async function verifyToken(token: string, secret: string, execCtx: ExecutionContext, env: Env): Promise<VerifyResult> {
+async function verifyToken(token: string, secret: string, _execCtx?: ExecutionContext, _env?: Env): Promise<VerifyResult> {
 	try {
 		const decoded = b64uDecode(token);
 
@@ -281,13 +350,13 @@ async function verifyToken(token: string, secret: string, execCtx: ExecutionCont
 		// for the signature. Keep this consistent with nise-be and nise-fe.
 		const lastDot = decoded.lastIndexOf('.');
 		if (lastDot === -1) {
-			fireErrorVerifyTokenWebhook(execCtx, token, secret, env, 'malformed_token', { decoded });
+			logTokenVerifyError('malformed_token', { decoded });
 			return { ok: false, reason: 'malformed_token' };
 		}
 		const json = decoded.slice(0, lastDot);
 		const sig = decoded.slice(lastDot + 1);
 		if (!json || !sig) {
-			fireErrorVerifyTokenWebhook(execCtx, token, secret, env, 'malformed_token', { json, sig });
+			logTokenVerifyError('malformed_token', { json, sig });
 			return { ok: false, reason: 'malformed_token' };
 		}
 
@@ -298,22 +367,20 @@ async function verifyToken(token: string, secret: string, execCtx: ExecutionCont
 		const expected = [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('');
 
 		if (!safeEqual(expected, sig)) {
-			fireErrorVerifyTokenWebhook(execCtx, token, secret, env, 'bad_signature', { expected, sig });
+			logTokenVerifyError('bad_signature', { expected, sig });
 			return { ok: false, reason: 'bad_signature' };
 		}
 
 		const payload = JSON.parse(json) as TokenPayload;
 
 		if (payload.exp !== undefined && payload.exp <= Math.floor(Date.now() / 1000)) {
-			fireErrorVerifyTokenWebhook(execCtx, token, secret, env, 'token_expired', { payload });
+			logTokenVerifyError('token_expired', { payload });
 			return { ok: false, reason: 'token_expired' };
 		}
 
 		return { ok: true, payload };
 	} catch (err: unknown) {
-		fireErrorVerifyTokenWebhook(execCtx, token, secret, env, `decode_error: ${err instanceof Error ? err.message : 'Unknown error'}`, {
-			err,
-		});
+		logTokenVerifyError(`decode_error: ${err instanceof Error ? err.message : 'Unknown error'}`, { err: String(err) });
 		return { ok: false, reason: 'decode_error' };
 	}
 }
@@ -503,6 +570,19 @@ export default {
 				req: reqLog,
 				identity,
 			});
+
+			fireIngestApi(execCtx, env, {
+				event: 'worker_error',
+				status: 500,
+				reason: message,
+				ctx,
+				referer,
+				userAgent: req.headers.get('user-agent') ?? undefined,
+				clientIp: req.headers.get('cf-connecting-ip') ?? undefined,
+				country: req.headers.get('cf-ipcountry') ?? undefined,
+				identity,
+			});
+
 			logEvent('worker_error', ctx, 500, message);
 
 			return resp(message, 500, origin, referer, allowed, {

@@ -1,5 +1,6 @@
 const DISCORD_FIELD_VALUE_LIMIT = 1000;
 const CLOUDFLARE_WEB_BOT_AUTH_AGENT = 'https://web-bot-auth-directory.radar.cloudflare.com/';
+const ADDITIONAL_ALLOWED_ORIGINS = ['https://www.loveblender.online'];
 
 function truncateWebhookFieldValue(value: string): string {
 	return value.slice(0, DISCORD_FIELD_VALUE_LIMIT);
@@ -70,10 +71,24 @@ function logEvent(event: string, ctx: ReqCtx, status: number, reason?: string): 
 
 /* ===================== CORS ===================== */
 
+function normalizeOrigin(origin: string): string {
+	return origin.trim().replace(/\/+$/, '');
+}
+
+function getAllowedOrigins(allowed: string): string[] {
+	return [...allowed.split(','), ...ADDITIONAL_ALLOWED_ORIGINS].map(normalizeOrigin).filter(Boolean);
+}
+
 function isAllowedOrigin(origin: string | null, referer: string, allowed: string): boolean {
+	const allowedOrigins = getAllowedOrigins(allowed);
 	if (!origin && !referer) return false;
-	if (origin === allowed) return true;
-	if (referer === allowed || referer.startsWith(allowed)) return true;
+	if (origin && allowedOrigins.includes(normalizeOrigin(origin))) return true;
+	if (referer) {
+		return allowedOrigins.some((allowedOrigin) => {
+			const normalizedReferer = normalizeOrigin(referer);
+			return normalizedReferer === allowedOrigin || normalizedReferer.startsWith(`${allowedOrigin}/`);
+		});
+	}
 	return false;
 }
 
@@ -217,9 +232,6 @@ function extractVideoIdFromPath(path: string): string | null {
 }
 
 function resolveIngestUrl(env: Env): string | null {
-	if (env.NISE_BE_INGEST_URL) {
-		return env.NISE_BE_INGEST_URL.trim();
-	}
 	if (!env.NISE_BE_API_URL) {
 		return null;
 	}

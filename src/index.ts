@@ -232,10 +232,16 @@ function extractVideoIdFromPath(path: string): string | null {
 }
 
 function resolveIngestUrl(env: Env): string | null {
+	if (env.NISE_BE_INGEST_URL) {
+		return env.NISE_BE_INGEST_URL.trim();
+	}
 	if (!env.NISE_BE_API_URL) {
 		return null;
 	}
-	return `${env.NISE_BE_API_URL.trim().replace(/\/+$/, '')}/worker-monitor/ingest`;
+	const apiUrl = env.NISE_BE_API_URL.trim()
+		.replace(/\/+$/, '')
+		.replace(/\/api$/, '');
+	return `${apiUrl}/worker-monitor/ingest`;
 }
 
 function fireIngestApi(
@@ -284,7 +290,11 @@ function fireIngestApi(
 	execCtx.waitUntil(
 		fetch(ingestUrl, {
 			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
+			headers: {
+				'Content-Type': 'application/json',
+				'User-Agent': 'NISE-Cloudflare-Worker/1.0',
+				'X-Worker-Log-Source': 'cloudflare-workers',
+			},
 			body: JSON.stringify(body),
 		})
 			.then(async (res) => {
